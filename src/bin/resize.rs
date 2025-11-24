@@ -1,3 +1,4 @@
+// src/bin/resize.rs
 use std::{env, process};
 
 use humansize::{format_size, BINARY, DECIMAL};
@@ -10,8 +11,6 @@ fn resize<D: Disk>(fs: &mut FileSystem<D>, size_arg: String) -> Result<(), Strin
         .size()
         .map_err(|err| format!("failed to read disk size: {}", err))?;
 
-    // Find contiguous free region
-    //TODO: better error management
     let mut last_free = None;
     let mut last_end = 0;
     fs.tx(|tx| {
@@ -33,7 +32,7 @@ fn resize<D: Disk>(fs: &mut FileSystem<D>, size_arg: String) -> Result<(), Strin
         }
         Ok(())
     })
-    .map_err(|err| format!("failed to read alloc log: {}", err))?;
+        .map_err(|err| format!("failed to read alloc log: {}", err))?;
 
     let old_size = fs.header.size();
     let min_size = if let Some(entry) = last_free {
@@ -106,12 +105,10 @@ fn resize<D: Disk>(fs: &mut FileSystem<D>, size_arg: String) -> Result<(), Strin
         (old_blocks, new_blocks, false)
     };
 
-    // Allocate or deallocate blocks as needed
     unsafe {
         let allocator = fs.allocator_mut();
         for index in start..end {
             if shrink {
-                //TODO: replace assert with error?
                 let addr = BlockAddr::new(index as u64, BlockMeta::default());
                 assert_eq!(allocator.allocate_exact(addr), Some(addr));
             } else {
@@ -122,16 +119,12 @@ fn resize<D: Disk>(fs: &mut FileSystem<D>, size_arg: String) -> Result<(), Strin
     }
 
     fs.tx(|tx| {
-        // Update header
         tx.header.size = new_size.into();
         tx.header_changed = true;
-
-        // Sync with squash
-        tx.sync(true)?;
-
+        tx.journal_commit()?;
         Ok(())
     })
-    .map_err(|err| format!("transaction failed: {}", err))
+        .map_err(|err| format!("transaction failed: {}", err))
 }
 
 fn main() {
