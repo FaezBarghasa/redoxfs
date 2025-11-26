@@ -168,7 +168,7 @@ fn filesystem_by_path(
 
         match DiskFile::open(path).map(DiskCache::new) {
             Ok(disk) => {
-                match redoxfs::FileSystem::open(disk, password_opt.as_deref(), block_opt, true) {
+                match redoxfs::FileSystem::open(disk, password_opt.as_deref(), block_opt, true, false) {
                     Ok(filesystem) => {
                         log::debug!(
                             "opened filesystem on {} with uuid {}",

@@ -99,6 +99,7 @@ fn main() {
         &bootloader,
         ctime.as_secs(),
         ctime.subsec_nanos(),
+        false,
     ) {
         Ok(filesystem) => {
             let uuid = Uuid::from_bytes(filesystem.header.uuid());

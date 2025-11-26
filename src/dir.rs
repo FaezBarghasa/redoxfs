@@ -2,6 +2,9 @@ use core::{mem, ops, slice, str};
 
 use crate::{BlockLevel, BlockTrait, Node, TreePtr, BLOCK_SIZE, DIR_ENTRY_MAX_LENGTH};
 
+/// A directory entry.
+///
+/// This struct contains the name of the entry and a pointer to its inode.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct DirEntry {
@@ -50,7 +53,7 @@ impl DirEntry {
         DirEntry::SERIALIZED_PREFIX_SIZE + self.name_len()
     }
 
-    fn serialize_into(&self, buf: &mut [u8]) -> Option<usize> {
+    pub fn serialize_into(&self, buf: &mut [u8]) -> Option<usize> {
         let required = self.serialized_size();
         if buf.len() < required {
             return None;
@@ -63,7 +66,7 @@ impl DirEntry {
         Some(required)
     }
 
-    fn deserialize_from(buf: &[u8]) -> Result<(Self, usize), &'static str> {
+    pub fn deserialize_from(buf: &[u8]) -> Result<(Self, usize), &'static str> {
         if buf.len() <= DirEntry::SERIALIZED_PREFIX_SIZE {
             return Err("Buffer too small");
         }
@@ -101,6 +104,10 @@ impl Default for DirEntry {
     }
 }
 
+/// A list of directory entries.
+///
+/// This struct represents a block containing a list of directory entries.
+/// It is used to store the contents of a directory.
 pub struct DirList {
     count: u16,
     entry_bytes_len: u16,

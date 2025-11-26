@@ -4,7 +4,7 @@ use aes::{
 };
 use xts_mode::Xts128;
 
-// The raw key, keep secret!
+/// The raw key, keep secret!
 #[repr(transparent)]
 pub struct Key([u8; 16]);
 

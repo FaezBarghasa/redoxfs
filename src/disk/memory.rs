@@ -3,6 +3,7 @@ use syscall::error::{Error, Result, EIO};
 use crate::disk::Disk;
 use crate::BLOCK_SIZE;
 
+/// A disk implemented in memory.
 pub struct DiskMemory {
     data: Vec<u8>,
 }

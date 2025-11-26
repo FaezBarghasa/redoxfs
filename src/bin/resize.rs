@@ -121,7 +121,6 @@ fn resize<D: Disk>(fs: &mut FileSystem<D>, size_arg: String) -> Result<(), Strin
     fs.tx(|tx| {
         tx.header.size = new_size.into();
         tx.header_changed = true;
-        tx.journal_commit()?;
         Ok(())
     })
         .map_err(|err| format!("transaction failed: {}", err))
@@ -153,7 +152,7 @@ fn main() {
         }
     };
 
-    let mut fs = match FileSystem::open(disk, None, None, true) {
+    let mut fs = match FileSystem::open(disk, None, None, true, false) {
         Ok(fs) => fs,
         Err(err) => {
             eprintln!(

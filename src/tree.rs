@@ -3,8 +3,8 @@ use endian_num::Le;
 
 use crate::{BlockLevel, BlockPtr, BlockRaw, BlockTrait};
 
-// 1 << 8 = 256, this is the number of entries in a TreeList
-const TREE_LIST_SHIFT: u32 = 8;
+// 1 << 7 = 128, this is the number of entries in a TreeList
+const TREE_LIST_SHIFT: u32 = 7;
 const TREE_LIST_ENTRIES: usize = (1 << TREE_LIST_SHIFT) - 2;
 
 /// A tree with 4 levels
@@ -16,7 +16,7 @@ pub struct TreeData<T> {
     /// The value of the [`TreePtr`]
     id: u32,
 
-    // The data
+    /// The data
     data: T,
 }
 
@@ -54,12 +54,15 @@ impl<T> TreeData<T> {
 #[repr(C, packed)]
 pub struct TreeList<T> {
     pub ptrs: [BlockPtr<T>; TREE_LIST_ENTRIES],
-    pub full_flags: [u128; 2],
+    pub full_flags: u128,
+    pub padding: [u8; 48],
 }
 
 impl<T> TreeList<T> {
     pub fn tree_list_is_full(&self) -> bool {
-        self.full_flags[1] == u128::MAX & !(3 << 126) && self.full_flags[0] == u128::MAX
+        // Bits 0..125 must be set (126 entries)
+        const MASK: u128 = (1u128 << TREE_LIST_ENTRIES) - 1;
+        self.full_flags & MASK == MASK
     }
 
     pub fn tree_list_is_empty(&self) -> bool {
@@ -73,20 +76,15 @@ impl<T> TreeList<T> {
 
     pub fn branch_is_full(&self, index: usize) -> bool {
         assert!(index < TREE_LIST_ENTRIES);
-        let shift = index % 128;
-        let full_flags_index = index / 128;
-        self.full_flags[full_flags_index] & (1 << shift) != 0
+        self.full_flags & (1 << index) != 0
     }
 
     pub fn set_branch_full(&mut self, index: usize, full: bool) {
         assert!(index < TREE_LIST_ENTRIES);
-        let shift = index % 128;
-        let full_flags_index = index / 128;
-
         if full {
-            self.full_flags[full_flags_index] |= 1 << shift;
+            self.full_flags |= 1 << index;
         } else {
-            self.full_flags[full_flags_index] &= !(1 << shift);
+            self.full_flags &= !(1 << index);
         }
     }
 }
@@ -96,7 +94,8 @@ unsafe impl<T> BlockTrait for TreeList<T> {
         if level.0 == 0 {
             Some(Self {
                 ptrs: [BlockPtr::default(); TREE_LIST_ENTRIES],
-                full_flags: [0; 2],
+                full_flags: 0,
+                padding: [0; 48],
             })
         } else {
             None

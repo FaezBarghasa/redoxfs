@@ -1,4 +1,20 @@
-// src/lib.rs
+//! # RedoxFS
+//!
+//! RedoxFS is a file system inspired by ZFS, designed for the Redox operating system.
+//! It supports features like Copy-on-Write (CoW), transparent encryption, and data checksumming.
+//!
+//! ## Architecture
+//!
+//! - **Block-based**: The filesystem is built on top of a block device abstraction (`Disk` trait).
+//! - **Copy-on-Write**: Data is never overwritten. New blocks are allocated for every write, ensuring consistency and enabling snapshots (though snapshots are not fully implemented in this crate).
+//! - **H-Tree**: Directories use an H-Tree structure for efficient lookups.
+//! - **Encryption**: Optional AES-XTS encryption for data confidentiality.
+//!
+//! ## Usage
+//!
+//! To mount a filesystem, use the `mount` function (requires `std` feature).
+//! To create a filesystem, use `FileSystem::create`.
+
 #![crate_name = "redoxfs"]
 #![crate_type = "lib"]
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -37,6 +53,7 @@ pub use self::key::{Key, KeySlot, Salt};
 #[cfg(feature = "std")]
 pub use self::mount::mount;
 pub use self::node::{Node, NodeFlags, NodeLevel, NodeLevelData};
+pub use self::quota::{QuotaEntry, QuotaList, QuotaRoot};
 pub use self::record::RecordRaw;
 pub use self::transaction::Transaction;
 pub use self::tree::{Tree, TreeData, TreeList, TreePtr};
@@ -65,6 +82,8 @@ mod transaction;
 mod tree;
 #[cfg(feature = "std")]
 mod unmount;
+
+mod quota;
 
 // New Modules
 pub mod journal;

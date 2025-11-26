@@ -10,6 +10,7 @@ fn syscall_err(err: syscall::Error) -> io::Error {
     io::Error::from_raw_os_error(err.errno)
 }
 
+/// Recursively archive files from `parent_path` into the filesystem at `parent_ptr`.
 pub fn archive_at<D: Disk, P: AsRef<Path>>(
     tx: &mut Transaction<D>,
     parent_path: P,
@@ -103,6 +104,9 @@ pub fn archive_at<D: Disk, P: AsRef<Path>>(
     Ok(())
 }
 
+/// Archive the contents of `parent_path` into the filesystem root.
+///
+/// Returns the size of the filesystem in bytes.
 pub fn archive<D: Disk, P: AsRef<Path>>(fs: &mut FileSystem<D>, parent_path: P) -> io::Result<u64> {
     let end_block = fs
         .tx(|tx| {

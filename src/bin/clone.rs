@@ -49,7 +49,7 @@ fn main() {
         }
     };
 
-    let mut fs_old = match FileSystem::open(disk_old, None, None, false) {
+    let mut fs_old = match FileSystem::open(disk_old, None, None, false, false) {
         Ok(fs) => fs,
         Err(err) => {
             println!(
@@ -101,6 +101,7 @@ fn main() {
         &bootloader,
         ctime.as_secs(),
         ctime.subsec_nanos(),
+        false,
     ) {
         Ok(fs) => fs,
         Err(err) => {

@@ -128,6 +128,7 @@ fn create_redoxfs(disk: DiskSparse, reserved_size: u64) -> bool {
         &reserved,
         ctime.as_secs(),
         ctime.subsec_nanos(),
+        false,
     )
     .is_ok()
 }
@@ -139,7 +140,7 @@ where
 {
     let password = None;
     let block = None;
-    let mut fs = FileSystem::open(disk, password, block, squash).unwrap();
+    let mut fs = FileSystem::open(disk, password, block, squash, false).unwrap();
 
     let mount_path = temp_path.join("mount");
     fs::create_dir_all(&mount_path).unwrap();

@@ -3,7 +3,10 @@ use core::ops;
 
 use crate::{BlockLevel, BlockTrait, RECORD_LEVEL};
 
-//TODO: this is a box to prevent stack overflows
+/// A raw data record.
+///
+/// This struct wraps a boxed byte slice, representing a unit of data in the filesystem.
+/// It is boxed to prevent stack overflows when handling large records.
 #[derive(Clone)]
 pub struct RecordRaw(pub(crate) Box<[u8]>);
 

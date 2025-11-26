@@ -3,8 +3,67 @@ use endian_num::Le;
 
 use crate::{BlockLevel, BlockList, BlockPtr, BlockTrait, RecordRaw, BLOCK_SIZE, RECORD_LEVEL};
 
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C, packed)]
+pub struct AclEntry {
+    pub tag: u8,
+    pub id: Le<u32>,
+    pub perms: Le<u16>,
+}
+
+pub const ACL_ENTRIES_PER_BLOCK: usize = BLOCK_SIZE as usize / mem::size_of::<AclEntry>();
+pub const ACL_TAG_USER: u8 = 1;
+pub const ACL_TAG_GROUP: u8 = 2;
+pub const ACL_TAG_OTHER: u8 = 3;
+pub const ACL_TAG_MASK: u8 = 4;
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct AclList {
+    pub entries: [AclEntry; ACL_ENTRIES_PER_BLOCK],
+}
+
+impl Default for AclList {
+    fn default() -> Self {
+        Self {
+            entries: [AclEntry::default(); ACL_ENTRIES_PER_BLOCK],
+        }
+    }
+}
+
+unsafe impl BlockTrait for AclList {
+    fn empty(level: BlockLevel) -> Option<Self> {
+        if level.0 == 0 {
+            Some(Self::default())
+        } else {
+            None
+        }
+    }
+}
+
+impl ops::Deref for AclList {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        unsafe {
+            slice::from_raw_parts(self as *const AclList as *const u8, mem::size_of::<AclList>())
+                as &[u8]
+        }
+    }
+}
+
+impl ops::DerefMut for AclList {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            slice::from_raw_parts_mut(self as *mut AclList as *mut u8, mem::size_of::<AclList>())
+                as &mut [u8]
+        }
+    }
+}
+
 bitflags::bitflags! {
+    /// Flags for a node.
     pub struct NodeFlags: u32 {
+        /// The node data is stored inline in the node itself.
         const INLINE_DATA = 0x1;
     }
 }
@@ -22,23 +81,23 @@ impl NodeLevel {
     // Warning: this uses constant record offsets, make sure to sync with Node
 
     /// Return the [`NodeLevel`] of the record with the given index.
-    /// - the first 128 are level 0,
-    /// - the next 64*256 are level 1,
+    /// - the first 56 are level 0,
+    /// - the next 36*128 are level 1,
     /// - ...and so on.
     pub fn new(mut record_offset: u64) -> Option<Self> {
-        // 1 << 8 = 256, this is the number of entries in a BlockList
-        const SHIFT: u64 = 8;
+        // 1 << 7 = 128, this is the number of entries in a BlockList (4096 / 32)
+        const SHIFT: u64 = 7;
         const NUM: u64 = 1 << SHIFT;
         const MASK: u64 = NUM - 1;
 
-        const L0: u64 = 128;
+        const L0: u64 = 56;
         if record_offset < L0 {
             return Some(Self::L0((record_offset & MASK) as usize));
         } else {
             record_offset -= L0;
         }
 
-        const L1: u64 = 64 * NUM;
+        const L1: u64 = 36 * NUM;
         if record_offset < L1 {
             return Some(Self::L1(
                 ((record_offset >> SHIFT) & MASK) as usize,
@@ -48,7 +107,7 @@ impl NodeLevel {
             record_offset -= L1;
         }
 
-        const L2: u64 = 32 * NUM * NUM;
+        const L2: u64 = 18 * NUM * NUM;
         if record_offset < L2 {
             return Some(Self::L2(
                 ((record_offset >> (2 * SHIFT)) & MASK) as usize,
@@ -59,7 +118,7 @@ impl NodeLevel {
             record_offset -= L2;
         }
 
-        const L3: u64 = 16 * NUM * NUM * NUM;
+        const L3: u64 = 10 * NUM * NUM * NUM;
         if record_offset < L3 {
             return Some(Self::L3(
                 ((record_offset >> (3 * SHIFT)) & MASK) as usize,
@@ -71,7 +130,7 @@ impl NodeLevel {
             record_offset -= L3;
         }
 
-        const L4: u64 = 12 * NUM * NUM * NUM * NUM;
+        const L4: u64 = 4 * NUM * NUM * NUM * NUM;
         if record_offset < L4 {
             Some(Self::L4(
                 ((record_offset >> (4 * SHIFT)) & MASK) as usize,
@@ -91,59 +150,48 @@ type BlockListL2 = BlockList<BlockListL1>;
 type BlockListL3 = BlockList<BlockListL2>;
 type BlockListL4 = BlockList<BlockListL3>;
 
+/// Data pointers for a node, organized by level.
+///
+/// This struct allows for efficient access to file data, supporting sparse files and large files.
+#[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct NodeLevelData {
-    /// The first 128 blocks of this file.
-    ///
-    /// Total size: 128 * RECORD_SIZE (16 MiB, 128 KiB each)
-    pub level0: [BlockPtr<RecordRaw>; 128],
+    /// The first 56 blocks of this file.
+    pub level0: [BlockPtr<RecordRaw>; 56],
 
-    /// The next 64 * 256 blocks of this file,
-    /// stored behind 64 level one tables.
-    ///
-    /// Total size: 64 * 256 * RECORD_SIZE (2 GiB, 32 MiB each)
-    pub level1: [BlockPtr<BlockListL1>; 64],
+    /// The next 36 * 128 blocks of this file.
+    pub level1: [BlockPtr<BlockListL1>; 36],
 
-    /// The next 32 * 256 * 256 blocks of this file,
-    /// stored behind 32 level two tables.
-    /// Each level two table points to 256 level one tables.
-    ///
-    /// Total size: 32 * 256 * 256 * RECORD_SIZE (256 GiB, 8 GiB each)
-    pub level2: [BlockPtr<BlockListL2>; 32],
+    /// The next 18 * 128^2 blocks.
+    pub level2: [BlockPtr<BlockListL2>; 18],
 
-    /// The next 16 * 256 * 256 * 256 blocks of this file,
-    /// stored behind 16 level three tables.
-    ///
-    /// Total size: 16 * 256 * 256 * 256 * RECORD_SIZE (32 TiB, 2 TiB each)
-    pub level3: [BlockPtr<BlockListL3>; 16],
+    /// The next 10 * 128^3 blocks.
+    pub level3: [BlockPtr<BlockListL3>; 10],
 
-    /// The next 8 * 256 * 256 * 256 * 256 blocks of this file,
-    /// stored behind 8 level four tables.
-    ///
-    /// Total size: 8 * 256 * 256 * 256 * 256 * RECORD_SIZE (4 PiB, 512 TiB each)
-    pub level4: [BlockPtr<BlockListL4>; 8],
+    /// The next 4 * 128^4 blocks.
+    pub level4: [BlockPtr<BlockListL4>; 4],
 }
 
 impl Default for NodeLevelData {
     fn default() -> Self {
         Self {
-            level0: [BlockPtr::default(); 128],
-            level1: [BlockPtr::default(); 64],
-            level2: [BlockPtr::default(); 32],
-            level3: [BlockPtr::default(); 16],
-            level4: [BlockPtr::default(); 8],
+            level0: [BlockPtr::default(); 56],
+            level1: [BlockPtr::default(); 36],
+            level2: [BlockPtr::default(); 18],
+            level3: [BlockPtr::default(); 10],
+            level4: [BlockPtr::default(); 4],
         }
     }
 }
 
-/// A file/folder node
+/// A file/folder node.
+///
+/// This struct represents an inode in the filesystem, containing metadata like permissions,
+/// timestamps, and pointers to data blocks.
+#[derive(Clone)]
 #[repr(C, packed)]
 pub struct Node {
     /// This node's type & permissions.
-    /// - four most significant bits are the node's type
-    /// - next four bits are permissions for the node's user
-    /// - next four bits are permissions for the node's group
-    /// - four least significant bits are permissions for everyone else
     pub mode: Le<u16>,
 
     /// The uid that owns this file
@@ -175,11 +223,23 @@ pub struct Node {
     /// Record level
     pub record_level: Le<u32>,
 
+    /// Compression hint (0 = None, 1 = LZ4, 2 = ZSTD)
+    pub compression_hint: u8,
+
     /// Flags
     pub flags: Le<u32>,
 
-    /// Padding
-    pub padding: [u8; BLOCK_SIZE as usize - 4042],
+    /// Padding.
+    /// BLOCK_SIZE = 4096.
+    /// Header = 75 bytes.
+    /// AclPtr = 32 bytes.
+    /// NodeLevelData = 124 * 32 = 3968 bytes.
+    /// Total used = 75 + 32 + 3968 = 4075 bytes.
+    /// Padding = 4096 - 4075 = 21 bytes.
+    pub padding: [u8; 21],
+
+    /// Pointer to the ACL list
+    pub acl_ptr: BlockPtr<AclList>,
 
     /// Level data, should not be used directly so inline data can be supported
     pub(crate) level_data: NodeLevelData,
@@ -212,8 +272,10 @@ impl Default for Node {
             atime: 0.into(),
             atime_nsec: 0.into(),
             record_level: 0.into(),
+            compression_hint: 0,
             flags: 0.into(),
-            padding: [0; BLOCK_SIZE as usize - 4042],
+            padding: [0; 21],
+            acl_ptr: BlockPtr::default(),
             level_data: NodeLevelData::default(),
         }
     }
@@ -265,11 +327,11 @@ impl Node {
         }
     }
 
-    /// This node's type & permissions.
-    /// - four most significant bits are the node's type
-    /// - next four bits are permissions for the node's user
-    /// - next four bits are permissions for the node's group
-    /// - four least significant bits are permissions for everyone else
+    /// Get the node's mode (type and permissions).
+    ///
+    /// The mode contains:
+    /// - 4 most significant bits: node type (file, dir, symlink, etc.)
+    /// - 12 least significant bits: permissions (rwx for user, group, other)
     pub fn mode(&self) -> u16 {
         self.mode.to_ne()
     }
@@ -358,6 +420,14 @@ impl Node {
         self.flags = flags.bits().into();
     }
 
+    pub fn set_compression_hint(&mut self, hint: u8) {
+        self.compression_hint = hint;
+    }
+
+    pub fn compression_hint(&self) -> u8 {
+        self.compression_hint
+    }
+
     pub fn has_inline_data(&self) -> bool {
         self.flags().contains(NodeFlags::INLINE_DATA)
     }
@@ -427,20 +497,39 @@ impl Node {
 
     /// Tests if the current user has enough permissions to view the file, op is the operation,
     /// like read and write, these modes are MODE_EXEC, MODE_READ, and MODE_WRITE
-    pub fn permission(&self, uid: u32, gid: u32, op: u16) -> bool {
+    pub fn permission(&self, uid: u32, gid: u32, op: u16, acl: Option<&AclList>) -> bool {
+        if uid == 0 {
+            return true;
+        }
+
+        if let Some(acl_list) = acl {
+            let mut found = false;
+            let mut acl_perm = 0;
+            for entry in acl_list.entries.iter() {
+                if entry.tag == 0 { break; }
+                if entry.tag == ACL_TAG_USER && entry.id.to_ne() == uid {
+                    acl_perm = entry.perms.to_ne();
+                    found = true;
+                    break;
+                }
+                // Group logic requires checking all groups.
+                // Simplified: Check if gid matches.
+                if entry.tag == ACL_TAG_GROUP && entry.id.to_ne() == gid {
+                     acl_perm |= entry.perms.to_ne();
+                     found = true;
+                }
+            }
+            if found {
+                return acl_perm & op == op;
+            }
+        }
+        
         let mut perm = self.mode() & 0o7;
         if self.uid() == uid {
-            // If self.mode is 101100110, >> 6 would be 000000101
-            // 0o7 is octal for 111, or, when expanded to 9 digits is 000000111
             perm |= (self.mode() >> 6) & 0o7;
-            // Since we erased the GID and OTHER bits when >>6'ing, |= will keep those bits in place.
         }
         if self.gid() == gid || gid == 0 {
             perm |= (self.mode() >> 3) & 0o7;
-        }
-        if uid == 0 {
-            //set the `other` bits to 111
-            perm |= 0o7;
         }
         perm & op == op
     }
@@ -517,7 +606,8 @@ fn node_inline_data_test() {
     assert!(node.level_data_mut().is_none());
 
     let node_addr = &node as *const Node as usize;
-    let meta_size = 128;
+    // Header size + padding + acl_ptr size
+    let meta_size = 75 + 21 + 32; 
     {
         let inline_data = node.inline_data().unwrap();
         let inline_data_addr = inline_data.as_ptr() as usize;
@@ -563,22 +653,22 @@ fn check_node_perms() {
     kani::assume(other_gid != root_gid);
 
     assert!(node.owner(uid));
-    assert!(node.permission(uid, gid, 0o7));
-    assert!(node.permission(uid, gid, 0o5));
-    assert!(node.permission(uid, other_gid, 0o7));
-    assert!(node.permission(uid, other_gid, 0o5));
-    assert!(!node.permission(other_uid, gid, 0o7));
-    assert!(node.permission(other_uid, gid, 0o5));
+    assert!(node.permission(uid, gid, 0o7, None));
+    assert!(node.permission(uid, gid, 0o5, None));
+    assert!(node.permission(uid, other_gid, 0o7, None));
+    assert!(node.permission(uid, other_gid, 0o5, None));
+    assert!(!node.permission(other_uid, gid, 0o7, None));
+    assert!(node.permission(other_uid, gid, 0o5, None));
 
     assert!(node.owner(root_uid));
-    assert!(node.permission(root_uid, root_gid, 0o7));
-    assert!(node.permission(root_uid, root_gid, 0o5));
-    assert!(node.permission(root_uid, other_gid, 0o7));
-    assert!(node.permission(root_uid, other_gid, 0o5));
-    assert!(!node.permission(other_uid, root_gid, 0o7));
-    assert!(node.permission(other_uid, root_gid, 0o5));
+    assert!(node.permission(root_uid, root_gid, 0o7, None));
+    assert!(node.permission(root_uid, root_gid, 0o5, None));
+    assert!(node.permission(root_uid, other_gid, 0o7, None));
+    assert!(node.permission(root_uid, other_gid, 0o5, None));
+    assert!(!node.permission(other_uid, root_gid, 0o7, None));
+    assert!(node.permission(other_uid, root_gid, 0o5, None));
 
     assert!(!node.owner(other_uid));
-    assert!(!node.permission(other_uid, other_gid, 0o7));
-    assert!(!node.permission(other_uid, other_gid, 0o5));
+    assert!(!node.permission(other_uid, other_gid, 0o7, None));
+    assert!(!node.permission(other_uid, other_gid, 0o5, None));
 }

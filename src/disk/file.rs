@@ -9,9 +9,9 @@ use syscall::error::{Error, Result, EIO};
 use crate::disk::{Disk, MediaType}; // Import MediaType
 use crate::BLOCK_SIZE;
 
-/// A disk implemented by a file
+/// A disk implemented by a file.
 pub struct DiskFile {
-    /// The file
+    /// The file.
     pub file: File,
     /// The media type, which can be overriden.
     pub media_type: MediaType,

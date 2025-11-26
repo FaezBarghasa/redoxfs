@@ -21,7 +21,7 @@ where
         let disk = DiskSparse::create(dbg!(&disk_path), 1024 * 1024 * 1024).unwrap();
 
         let ctime = dbg!(time::SystemTime::now().duration_since(time::UNIX_EPOCH)).unwrap();
-        let fs = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos()).unwrap();
+        let fs = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos(), false).unwrap();
 
         callback(fs)
     };
@@ -141,7 +141,7 @@ fn many_create_write_list_find_read_delete() {
     let ctime = time::SystemTime::now()
         .duration_since(time::UNIX_EPOCH)
         .unwrap();
-    let mut fs = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos()).unwrap();
+    let mut fs = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos(), false).unwrap();
     let tree_ptr = TreePtr::<Node>::root();
     let total_count = 3000;
 
@@ -553,6 +553,114 @@ fn delete_to_empty() {
         })
         .unwrap();
     });
+}
+
+#[test]
+#[ignore]
+fn mirroring_test() {
+    let disk_path = format!("image{}.bin", IMAGE_SEQ.fetch_add(1, Relaxed));
+    let disk = DiskSparse::create(&disk_path, 64 * 1024 * 1024).unwrap(); // 64MB
+    let ctime = time::SystemTime::now().duration_since(time::UNIX_EPOCH).unwrap();
+    // Create FS with mirroring enabled
+    let mut fs = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos(), true).unwrap();
+
+    let tree_ptr = TreePtr::<Node>::root();
+    let name = "mirror_test_file";
+
+    // Create file
+    let node = fs.tx(|tx| {
+        tx.create_node(
+            tree_ptr,
+            name,
+            Node::MODE_FILE | 0644,
+            1,
+            0,
+        )
+    }).unwrap();
+
+    // Write data
+    fs.tx(|tx| {
+        tx.write_node(
+            node.ptr(),
+            0,
+            b"hello world",
+            ctime.as_secs(),
+            ctime.subsec_nanos(),
+        )
+    }).unwrap();
+
+    // Check mirror_addr
+    fs.tx(|tx| {
+        let node_read = tx.read_tree(node.ptr())?;
+        let level_data = level_data(&node_read)?;
+        let ptr = level_data.level0[0];
+        
+        assert!(!ptr.is_null(), "Data pointer should not be null");
+        assert!(!ptr.mirror_addr().is_null(), "Mirror pointer should not be null when mirroring is enabled");
+        
+        Ok(())
+    }).unwrap();
+
+    fs::remove_file(&disk_path).unwrap();
+}
+
+#[test]
+fn compression_test() {
+    let disk_path = format!("image{}.bin", IMAGE_SEQ.fetch_add(1, Relaxed));
+    let disk = DiskSparse::create(&disk_path, 64 * 1024 * 1024).unwrap();
+    let ctime = time::SystemTime::now().duration_since(time::UNIX_EPOCH).unwrap();
+    let mut fs = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos(), false).unwrap();
+
+    let tree_ptr = TreePtr::<Node>::root();
+    let name = "compressed_file";
+
+    // Create file
+    let node = fs.tx(|tx| {
+        let mut node = tx.create_node(
+            tree_ptr,
+            name,
+            Node::MODE_FILE | 0644,
+            1,
+            0,
+        )?;
+        node.data_mut().set_compression_hint(1); // LZ4
+        tx.sync_tree(node.clone())?; // Save hint
+        Ok(node)
+    }).unwrap();
+
+    // Write compressible data (128KB of zeros)
+    let data = vec![0u8; BLOCK_SIZE as usize * 32]; // 4KB * 32 = 128KB
+    fs.tx(|tx| {
+        tx.write_node(
+            node.ptr(),
+            0,
+            &data,
+            ctime.as_secs(),
+            ctime.subsec_nanos(),
+        )
+    }).unwrap();
+
+    // Check block level
+    fs.tx(|tx| {
+        let node_read = tx.read_tree(node.ptr())?;
+        let level_data = level_data(&node_read)?;
+        let ptr = level_data.level0[0]; // First block
+        
+        assert!(!ptr.is_null());
+        // Expected level 0 (4KB) because compressed data is small
+        assert_eq!(ptr.addr().level().0, 0, "Compressed block should be level 0");
+        // Expected decomp level 5 (128KB)
+        assert_eq!(ptr.addr().decomp_level().map(|l| l.0), Some(5), "Decomp level should be 5");
+        
+        // Read back data to verify correctness
+        let mut read_buf = vec![0u8; data.len()];
+        tx.read_node(node.ptr(), 0, &mut read_buf, 0, 0)?;
+        assert_eq!(read_buf, data);
+        
+        Ok(())
+    }).unwrap();
+
+    fs::remove_file(&disk_path).unwrap();
 }
 
 #[test]

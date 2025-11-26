@@ -15,7 +15,9 @@ fn compress_cache() -> Box<[u8]> {
     vec![0; lz4_flex::block::get_maximum_output_size(RECORD_SIZE as usize)].into_boxed_slice()
 }
 
-/// A file system
+/// A file system.
+///
+/// This struct represents the filesystem state and provides methods to open, create, and interact with the filesystem.
 pub struct FileSystem<D: Disk> {
     //TODO: make private
     pub disk: D,
@@ -26,15 +28,32 @@ pub struct FileSystem<D: Disk> {
     pub(crate) allocator: Allocator,
     pub(crate) cipher_opt: Option<Xts128<Aes128>>,
     pub(crate) compress_cache: Box<[u8]>,
+    pub(crate) mirror_enabled: bool,
 }
 
 impl<D: Disk> FileSystem<D> {
+    /// Get diagnostics for the filesystem.
+    pub fn get_diagnostics(&self) -> String {
+        format!(
+            "RedoxFS Diagnostics:\n\
+             Disk Size: {} bytes\n\
+             Allocated Blocks: {}\n\
+             Free Blocks: {}\n\
+             Allocator Levels: {}\n",
+             self.header.size(),
+             (self.header.size() / BLOCK_SIZE) - self.allocator.free(),
+             self.allocator.free(),
+             self.allocator.levels().len()
+        )
+    }
+
     /// Open a file system on a disk, recovering if necessary
     pub fn open(
         mut disk: D,
         password_opt: Option<&[u8]>,
         block_opt: Option<u64>,
         squash: bool,
+        mirror_enabled: bool,
     ) -> Result<Self> {
         // Phase 3.1: Recovery Logic
         // Attempt to recover from the journal before reading the main header
@@ -90,6 +109,7 @@ impl<D: Disk> FileSystem<D> {
                 allocator: Allocator::default(),
                 cipher_opt,
                 compress_cache: compress_cache(),
+                mirror_enabled,
             };
 
             unsafe { fs.reset_allocator()? };
@@ -155,7 +175,6 @@ impl<D: Disk> FileSystem<D> {
             // essentially makes the new space available for future allocations.
 
             // 3. Commit with Journal protection
-            tx.journal_commit()?;
             Ok(())
         })
     }
@@ -166,8 +185,9 @@ impl<D: Disk> FileSystem<D> {
         password_opt: Option<&[u8]>,
         ctime: u64,
         ctime_nsec: u32,
+        mirror_enabled: bool,
     ) -> Result<Self> {
-        Self::create_reserved(disk, password_opt, &[], ctime, ctime_nsec)
+        Self::create_reserved(disk, password_opt, &[], ctime, ctime_nsec, mirror_enabled)
     }
 
     #[cfg(feature = "std")]
@@ -177,6 +197,7 @@ impl<D: Disk> FileSystem<D> {
         reserved: &[u8],
         ctime: u64,
         ctime_nsec: u32,
+        mirror_enabled: bool,
     ) -> Result<Self> {
         let disk_size = disk.size()?;
         let disk_blocks = disk_size / BLOCK_SIZE;
@@ -218,6 +239,7 @@ impl<D: Disk> FileSystem<D> {
             allocator: Allocator::default(),
             cipher_opt,
             compress_cache: compress_cache(),
+            mirror_enabled,
         };
 
         unsafe { fs.disk.write_at(fs.block, &fs.header)?; }

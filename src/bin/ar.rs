@@ -70,6 +70,7 @@ fn main() {
         &bootloader,
         ctime.as_secs(),
         ctime.subsec_nanos(),
+        false,
     ) {
         Ok(mut fs) => {
             let size = match archive(&mut fs, &folder_path) {

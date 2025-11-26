@@ -12,7 +12,13 @@ const BLOCK_LIST_ENTRIES: usize = BLOCK_SIZE as usize / mem::size_of::<BlockPtr<
 /// the next four bits indicates decompression level,
 /// the rest encode its index.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct BlockAddr(u64);
+pub struct BlockAddr(pub u64);
+
+impl From<BlockAddr> for Le<u64> {
+    fn from(addr: BlockAddr) -> Self {
+        addr.0.into()
+    }
+}
 
 impl BlockAddr {
     const INDEX_SHIFT: u64 = 8;
@@ -77,6 +83,7 @@ impl BlockAddr {
     }
 }
 
+/// Metadata about a block, such as its level and compression state.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct BlockMeta {
     pub(crate) level: BlockLevel,
@@ -135,6 +142,7 @@ impl BlockLevel {
     }
 }
 
+/// A trait for block content types.
 pub unsafe trait BlockTrait {
     /// Create an empty block of this type.
     fn empty(level: BlockLevel) -> Option<Self>
@@ -143,6 +151,8 @@ pub unsafe trait BlockTrait {
 }
 
 /// A [`BlockAddr`] and the data it points to.
+///
+/// This struct wraps block content with its address, useful for reading/writing.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BlockData<T> {
     addr: BlockAddr,
@@ -194,13 +204,18 @@ impl<T: BlockTrait> BlockData<T> {
 impl<T: ops::Deref<Target = [u8]>> BlockData<T> {
     pub fn create_ptr(&self) -> BlockPtr<T> {
         BlockPtr {
-            addr: self.addr.0.into(),
+            primary_addr: self.addr.0.into(),
+            mirror_addr: 0.into(),
             hash: seahash::hash(self.data.deref()).into(),
+            padding: 0.into(),
             phantom: PhantomData,
         }
     }
 }
 
+/// A list of block pointers.
+///
+/// This is a block containing pointers to other blocks, forming a tree structure or list.
 #[repr(C, packed)]
 pub struct BlockList<T> {
     pub ptrs: [BlockPtr<T>; BLOCK_LIST_ENTRIES],
@@ -256,22 +271,30 @@ impl<T> ops::DerefMut for BlockList<T> {
 /// Also see [`BlockAddr`].
 #[repr(C, packed)]
 pub struct BlockPtr<T> {
-    addr: Le<u64>,
-    hash: Le<u64>,
-    phantom: PhantomData<T>,
+    pub primary_addr: Le<u64>,
+    pub mirror_addr: Le<u64>,
+    pub hash: Le<u64>,
+    pub padding: Le<u64>,
+    pub phantom: PhantomData<T>,
 }
 
 impl<T> BlockPtr<T> {
     pub fn null(meta: BlockMeta) -> Self {
         Self {
-            addr: BlockAddr::null(meta).0.into(),
+            primary_addr: BlockAddr::null(meta).0.into(),
+            mirror_addr: BlockAddr::null(meta).0.into(),
             hash: 0.into(),
+            padding: 0.into(),
             phantom: PhantomData,
         }
     }
 
     pub fn addr(&self) -> BlockAddr {
-        BlockAddr(self.addr.to_ne())
+        BlockAddr(self.primary_addr.to_ne())
+    }
+
+    pub fn mirror_addr(&self) -> BlockAddr {
+        BlockAddr(self.mirror_addr.to_ne())
     }
 
     pub fn hash(&self) -> u64 {
@@ -285,14 +308,16 @@ impl<T> BlockPtr<T> {
     pub fn marker(level: u8) -> Self {
         assert!(level <= 0xF);
         Self {
-            addr: (0xFFFF_FFFF_FFFF_FFF0 | (level as u64)).into(),
+            primary_addr: (0xFFFF_FFFF_FFFF_FFF0 | (level as u64)).into(),
+            mirror_addr: 0.into(),
             hash: u64::MAX.into(),
+            padding: 0.into(),
             phantom: PhantomData,
         }
     }
 
     pub fn is_marker(&self) -> bool {
-        (self.addr.to_ne() | 0xF) == u64::MAX && self.hash.to_ne() == u64::MAX
+        (self.primary_addr.to_ne() | 0xF) == u64::MAX && self.hash.to_ne() == u64::MAX
     }
 
     /// Cast BlockPtr to another type
@@ -301,8 +326,10 @@ impl<T> BlockPtr<T> {
     /// Unsafe because it can be used to transmute types
     pub unsafe fn cast<U>(self) -> BlockPtr<U> {
         BlockPtr {
-            addr: self.addr,
+            primary_addr: self.primary_addr,
+            mirror_addr: self.mirror_addr,
             hash: self.hash,
+            padding: self.padding,
             phantom: PhantomData,
         }
     }
@@ -326,8 +353,10 @@ impl<T> Copy for BlockPtr<T> {}
 impl<T> Default for BlockPtr<T> {
     fn default() -> Self {
         Self {
-            addr: 0.into(),
+            primary_addr: 0.into(),
+            mirror_addr: 0.into(),
             hash: 0.into(),
+            padding: 0.into(),
             phantom: PhantomData,
         }
     }
@@ -335,15 +364,20 @@ impl<T> Default for BlockPtr<T> {
 
 impl<T> fmt::Debug for BlockPtr<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let addr = self.addr();
+        let primary_addr = self.addr();
+        let mirror_addr = self.mirror_addr();
         let hash = self.hash();
         f.debug_struct("BlockPtr")
-            .field("addr", &addr)
+            .field("primary_addr", &primary_addr)
+            .field("mirror_addr", &mirror_addr)
             .field("hash", &hash)
             .finish()
     }
 }
 
+/// A raw data block.
+///
+/// This block type provides access to the raw bytes of a block.
 #[repr(C, packed)]
 #[derive(Clone)]
 pub struct BlockRaw([u8; BLOCK_SIZE as usize]);

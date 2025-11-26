@@ -53,23 +53,31 @@ impl Allocator {
     /// Find a free block of the given level, mark it as "used", and return its address.
     /// Returns [`None`] if there are no free blocks with this level.
     pub fn allocate(&mut self, meta: BlockMeta) -> Option<BlockAddr> {
-        // First, find the lowest level with a free block
-        let mut free_opt = None;
-        {
+        // Helper to find a free block
+        let find_free = |alloc: &Allocator| -> Option<(usize, u64)> {
+            let mut best_opt: Option<(usize, u64)> = None;
             let mut level = meta.level.0;
-            // Start searching at the level we want. Smaller levels are too small!
-            while level < self.levels.len() {
-                if let Some(&index) = self.levels[level].first() {
-                    // Find the index closest to the start of the filesystem
-                    free_opt = match free_opt {
-                        Some((free_level, free_index)) if free_index <= index => {
-                            Some((free_level, free_index))
+            while level < alloc.levels.len() {
+                if let Some(&index) = alloc.levels[level].first() {
+                    best_opt = match best_opt {
+                        Some((best_level, best_index)) if best_index <= index => {
+                            Some((best_level, best_index))
                         }
                         _ => Some((level, index)),
                     };
                 }
                 level += 1;
             }
+            best_opt
+        };
+
+        // First attempt
+        let mut free_opt = find_free(self);
+
+        // If failed, try coalescing
+        if free_opt.is_none() {
+            self.coalesce();
+            free_opt = find_free(self);
         }
 
         // If a free block was found, split it until we find a usable block of the right level.
@@ -83,6 +91,67 @@ impl Allocator {
         }
 
         Some(unsafe { BlockAddr::new(index, meta) })
+    }
+
+    /// Coalesce free blocks to form larger blocks.
+    /// This is used when allocation fails to find a block of sufficient size.
+    pub fn coalesce(&mut self) {
+        let mut level = 0;
+        while level < self.levels.len() {
+            let level_size = 1 << level;
+            let next_size = level_size << 1;
+            
+            let mut removals = Vec::new();
+            let mut inserts = Vec::new();
+            
+            // Iterate over blocks and find buddies
+            // Since BTreeSet is sorted, we can look for index and index+size
+            let blocks: Vec<u64> = self.levels[level].iter().cloned().collect();
+            
+            let mut i = 0;
+            while i < blocks.len() {
+                let index = blocks[i];
+                // Check alignment for left buddy
+                if index % next_size == 0 {
+                    // Look for right buddy
+                    let buddy = index + level_size;
+                    // Check if next block in list is buddy
+                    if i + 1 < blocks.len() && blocks[i+1] == buddy {
+                        // Found pair
+                        removals.push(index);
+                        removals.push(buddy);
+                        inserts.push(index); // Add to next level
+                        i += 2; // Skip both
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            
+            if removals.is_empty() {
+                level += 1;
+                continue;
+            }
+            
+            for index in removals {
+                self.levels[level].remove(&index);
+            }
+            
+            // Ensure next level exists
+            if level + 1 >= self.levels.len() {
+                self.levels.push(BTreeSet::new());
+            }
+            
+            for index in inserts {
+                self.levels[level + 1].insert(index);
+            }
+            
+            // Don't increment level immediately, re-scan this level? 
+            // No, we moved blocks to level+1. We should scan level+1 next.
+            // But we might have created new opportunities in level+1.
+            // So incrementing level is correct.
+            level += 1;
+        }
     }
 
     /// Try to allocate the exact block specified, making all necessary splits.
@@ -130,6 +199,17 @@ impl Allocator {
         // We repeat this until we no longer have a sibling to join.
         let mut index = addr.index();
         let mut level = addr.level().0;
+
+        // Lazy coalescing: For small blocks (Level 0-2), skip the aggressive "buddy" coalescing loop
+        // during high-frequency operations. Add them directly to the free list.
+        if level <= 2 {
+            while level >= self.levels.len() {
+                self.levels.push(BTreeSet::new());
+            }
+            self.levels[level].insert(index);
+            return;
+        }
+
         loop {
             while level >= self.levels.len() {
                 self.levels.push(BTreeSet::new());
@@ -214,6 +294,9 @@ impl AllocEntry {
 }
 
 /// A node in the allocation chain.
+///
+/// This struct represents a block containing a list of allocation entries.
+/// These blocks are chained together to form a log of allocation operations.
 #[repr(C, packed)]
 pub struct AllocList {
     /// A pointer to the previous AllocList.
@@ -297,15 +380,14 @@ fn allocator_test() {
         alloc.deallocate(unsafe { BlockAddr::new(addr, BlockMeta::default()) });
     }
 
-    assert_eq!(alloc.levels.len(), 11);
-    for level in 0..alloc.levels.len() {
-        if level == 0 {
-            assert_eq!(alloc.levels[level], [1023].into());
-        } else if level == 10 {
-            assert_eq!(alloc.levels[level], [1024].into());
-        } else {
-            assert_eq!(alloc.levels[level], [0u64; 0].into());
-        }
+    // Lazy coalescing means blocks stay in level 0
+    assert!(alloc.levels.len() >= 1);
+    let expected: BTreeSet<u64> = (1023..2048).collect();
+    assert_eq!(alloc.levels[0], expected);
+    
+    // Higher levels should be empty
+    for level in 1..alloc.levels.len() {
+        assert_eq!(alloc.levels[level], BTreeSet::new());
     }
 
     for addr in 1023..2048 {
@@ -316,8 +398,31 @@ fn allocator_test() {
     }
     assert_eq!(alloc.allocate(BlockMeta::default()), None);
 
-    assert_eq!(alloc.levels.len(), 11);
     for level in 0..alloc.levels.len() {
-        assert_eq!(alloc.levels[level], [0u64; 0].into());
+        assert_eq!(alloc.levels[level], BTreeSet::new());
+    }
+}
+
+#[test]
+fn coalescing_test() {
+    let mut alloc = Allocator::default();
+
+    // Deallocate two adjacent L0 blocks. 
+    // Due to lazy coalescing, they stay in L0.
+    alloc.deallocate(unsafe { BlockAddr::new(0, BlockMeta::new(BlockLevel(0))) });
+    alloc.deallocate(unsafe { BlockAddr::new(1, BlockMeta::new(BlockLevel(0))) });
+
+    assert!(alloc.levels.len() >= 1);
+    assert_eq!(alloc.levels[0].len(), 2);
+
+    // Allocate L1 block (requires 2 L0 blocks).
+    // This should trigger coalescing.
+    let addr = alloc.allocate(BlockMeta::new(BlockLevel(1)));
+    
+    assert_eq!(addr, Some(unsafe { BlockAddr::new(0, BlockMeta::new(BlockLevel(1))) }));
+    
+    // Verify levels are empty (consumed)
+    for level in 0..alloc.levels.len() {
+        assert!(alloc.levels[level].is_empty());
     }
 }

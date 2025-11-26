@@ -3,14 +3,15 @@ use core::mem;
 use crate::{BLOCK_SIZE, HEADER_RING};
 use endian_num::Le;
 
-// Reserved block indices for the journal
-// These sit immediately after the header ring.
-// HEADER_RING is usually 256.
+/// Reserved block indices for the journal.
+///
+/// These sit immediately after the header ring.
+/// HEADER_RING is usually 256.
 pub const JOURNAL_START_BLOCK: u64 = HEADER_RING;
 pub const JOURNAL_SIZE_BLOCKS: u64 = 16;
 pub const JOURNAL_HEADER_MAGIC: u64 = 0xDEADBEEF00F5C0FE;
 
-// The static metadata blocks (Tree, Alloc, Root) start after the journal
+/// The static metadata blocks (Tree, Alloc, Root) start after the journal.
 pub const METADATA_START_BLOCK: u64 = JOURNAL_START_BLOCK + JOURNAL_SIZE_BLOCKS;
 
 /// Represents a single metadata block update within a transaction.

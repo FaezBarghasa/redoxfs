@@ -24,7 +24,7 @@ where
     {
         let disk = DiskSparse::create(dbg!(&disk_path), 1024 * 1024 * 1024).unwrap();
         let ctime = dbg!(time::SystemTime::now().duration_since(time::UNIX_EPOCH)).unwrap();
-        FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos()).unwrap();
+        FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos(), false).unwrap();
     }
     let res = callback(&disk_path);
 
@@ -286,7 +286,7 @@ fn many_create_write_list_find_read_delete() {
     let ctime = time::SystemTime::now()
         .duration_since(time::UNIX_EPOCH)
         .unwrap();
-    let mut fs = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos()).unwrap();
+    let mut fs = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos(), false).unwrap();
     let tree_ptr = TreePtr::<Node>::root();
     let total_count = 3000;
 

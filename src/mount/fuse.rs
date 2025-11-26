@@ -16,7 +16,7 @@ use crate::{filesystem, Disk, Node, Transaction, TreeData, TreePtr, BLOCK_SIZE};
 
 use self::fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyStatfs, ReplyWrite, Request, Session,
+    ReplyEntry, ReplyStatfs, ReplyWrite, ReplyXattr, Request, Session,
 };
 use std::time::Duration;
 
@@ -24,6 +24,9 @@ const TTL: Duration = Duration::new(1, 0); // 1 second
 
 const NULL_TIME: Duration = Duration::new(0, 0);
 
+/// Mount a RedoxFS filesystem using FUSE.
+///
+/// `callback` is called once the filesystem is mounted, with the path to the mountpoint.
 pub fn mount<D, P, T, F>(
     mut filesystem: filesystem::FileSystem<D>,
     mountpoint: P,
@@ -68,10 +71,13 @@ where
     Ok(res)
 }
 
+/// A FUSE filesystem implementation for RedoxFS.
 pub struct Fuse<'f, D: Disk> {
+    /// The underlying RedoxFS filesystem.
     pub fs: &'f mut filesystem::FileSystem<D>,
 }
 
+/// Convert a RedoxFS node to a FUSE file attribute.
 fn node_attr(node: &TreeData<Node>) -> FileAttr {
     FileAttr {
         ino: node.id() as u64,
@@ -549,5 +555,67 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err.errno),
         }
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request,
+        node_id: u64,
+        name: &OsStr,
+        value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if name.to_str() == Some("system.posix_acl_access") {
+             if value.len() < 4 {
+                 reply.error(syscall::error::EINVAL);
+                 return;
+             }
+             
+             let count = (value.len() - 4) / 8;
+             if count > crate::node::ACL_ENTRIES_PER_BLOCK {
+                 reply.error(syscall::error::ENOSPC);
+                 return;
+             }
+             
+             let mut acl = crate::node::AclList::default();
+             for i in 0..count {
+                 let off = 4 + i * 8;
+                 if off + 8 > value.len() { break; }
+                 
+                 let tag = u16::from_le_bytes([value[off], value[off+1]]);
+                 let perm = u16::from_le_bytes([value[off+2], value[off+3]]);
+                 let id = u32::from_le_bytes([value[off+4], value[off+5], value[off+6], value[off+7]]);
+                 
+                 // Basic mapping
+                 let my_tag = match tag {
+                     1 => crate::node::ACL_TAG_USER, // UserObj
+                     2 => crate::node::ACL_TAG_USER, // User
+                     4 => crate::node::ACL_TAG_GROUP, // Group
+                     _ => 0,
+                 };
+                 
+                 if my_tag != 0 {
+                     acl.entries[i] = crate::node::AclEntry {
+                         tag: my_tag,
+                         id: id.into(),
+                         perms: perm.into(),
+                     };
+                 }
+             }
+             
+             let node_ptr = TreePtr::<Node>::new(node_id as u32);
+             match self.fs.tx(|tx| tx.set_acl(node_ptr, &acl)) {
+                 Ok(_) => reply.ok(),
+                 Err(e) => reply.error(e.errno),
+             }
+        } else {
+             reply.error(syscall::error::EOPNOTSUPP);
+        }
+    }
+
+    fn getxattr(&mut self, _req: &Request, _inode: u64, _name: &OsStr, _size: u32, reply: ReplyXattr) {
+        reply.error(syscall::error::EOPNOTSUPP);
     }
 }

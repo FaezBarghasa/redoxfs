@@ -1,3 +1,8 @@
+//! Filesystem mounting support.
+//!
+//! This module handles mounting the filesystem on different operating systems.
+//! It uses FUSE on non-Redox systems and the native scheme mechanism on Redox OS.
+
 #[cfg(all(not(target_os = "redox"), not(fuzzing), feature = "fuse"))]
 mod fuse;
 

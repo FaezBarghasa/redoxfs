@@ -162,7 +162,7 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
                     return Err(Error::new(EEXIST));
                 } else if node.data().is_dir() {
                     if flags & O_ACCMODE == O_RDONLY {
-                        if !node.data().permission(uid, gid, Node::MODE_READ) {
+                        if !self.fs.tx(|tx| tx.permission(node.data(), uid, gid, Node::MODE_READ))? {
                             // println!("dir not readable {:o}", node.data().mode);
                             return Err(Error::new(EACCES));
                         }
@@ -229,21 +229,21 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
                     }
 
                     if (flags & O_ACCMODE == O_RDONLY || flags & O_ACCMODE == O_RDWR)
-                        && !node.data().permission(uid, gid, Node::MODE_READ)
+                        && !self.fs.tx(|tx| tx.permission(node.data(), uid, gid, Node::MODE_READ))?
                     {
                         // println!("file not readable {:o}", node.data().mode);
                         return Err(Error::new(EACCES));
                     }
 
                     if (flags & O_ACCMODE == O_WRONLY || flags & O_ACCMODE == O_RDWR)
-                        && !node.data().permission(uid, gid, Node::MODE_WRITE)
+                        && !self.fs.tx(|tx| tx.permission(node.data(), uid, gid, Node::MODE_WRITE))?
                     {
                         // println!("file not writable {:o}", node.data().mode);
                         return Err(Error::new(EACCES));
                     }
 
                     if flags & O_TRUNC == O_TRUNC {
-                        if !node.data().permission(uid, gid, Node::MODE_WRITE) {
+                        if !self.fs.tx(|tx| tx.permission(node.data(), uid, gid, Node::MODE_WRITE))? {
                             // println!("file not writable {:o}", node.data().mode);
                             return Err(Error::new(EACCES));
                         }
@@ -273,7 +273,7 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
                     }
                     if !last_part.is_empty() {
                         if let Some((parent, _parent_name)) = nodes.last() {
-                            if !parent.data().permission(uid, gid, Node::MODE_WRITE) {
+                            if !self.fs.tx(|tx| tx.permission(parent.data(), uid, gid, Node::MODE_WRITE))? {
                                 // println!("dir not writable {:o}", parent.1.mode);
                                 return Err(Error::new(EACCES));
                             }
@@ -372,7 +372,7 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
             part_opt = parts.next();
             if let Some(part) = part_opt {
                 let node = node_res?;
-                if !node.data().permission(uid, gid, Node::MODE_EXEC) {
+                if !tx.permission(node.data(), uid, gid, Node::MODE_EXEC)? {
                     return Err(Error::new(EACCES));
                 }
                 if node.data().is_symlink() {
@@ -453,13 +453,13 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
                 return Err(Error::new(EPERM));
             };
 
-            if !parent.data().permission(uid, gid, Node::MODE_WRITE) {
+            if !tx.permission(parent.data(), uid, gid, Node::MODE_WRITE)? {
                 // println!("dir not writable {:o}", parent.1.mode);
                 return Err(Error::new(EACCES));
             }
 
             if child.data().is_dir() {
-                if !child.data().permission(uid, gid, Node::MODE_WRITE) {
+                if !tx.permission(child.data(), uid, gid, Node::MODE_WRITE)? {
                     // println!("dir not writable {:o}", parent.1.mode);
                     return Err(Error::new(EACCES));
                 }
@@ -493,7 +493,7 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
                 return Err(Error::new(EPERM));
             };
 
-            if !parent.data().permission(uid, gid, Node::MODE_WRITE) {
+            if !tx.permission(parent.data(), uid, gid, Node::MODE_WRITE)? {
                 // println!("dir not writable {:o}", parent.1.mode);
                 return Err(Error::new(EACCES));
             }
@@ -964,7 +964,7 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         if !parent_node.data().is_dir() {
             return Err(Error::new(ENOTDIR));
         }
-        if !parent_node.data().permission(uid, gid, Node::MODE_WRITE) {
+        if !self.fs.tx(|tx| tx.permission(parent_node.data(), uid, gid, Node::MODE_WRITE))? {
             return Err(Error::new(EACCES));
         }
         let parent_path = parent_resource.path();

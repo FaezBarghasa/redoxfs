@@ -16,6 +16,7 @@ macro_rules! try_disk {
     };
 }
 
+/// A wrapper around any type that implements `Read`, `Write`, and `Seek`, implementing `Disk`.
 pub struct DiskIo<T>(pub T);
 
 impl<T: Read + Write + Seek> Disk for DiskIo<T> {

@@ -12,6 +12,9 @@ pub const HTREE_IDX_ENTRIES: usize = BLOCK_SIZE as usize / mem::size_of::<HTreeP
 const HTREE_IDX_PADDING: usize =
     BLOCK_SIZE as usize - mem::size_of::<[HTreePtr<BlockRaw>; HTREE_IDX_ENTRIES]>();
 
+/// A hash used for H-Tree indexing.
+///
+/// This hash is used to order entries in the H-Tree.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(C, packed)]
 pub struct HTreeHash(Le<u32>);
@@ -86,6 +89,7 @@ impl Default for HTreeHash {
     }
 }
 
+/// A pointer to a block in an H-Tree, along with its hash key.
 #[repr(C, packed)]
 pub struct HTreePtr<T> {
     pub htree_hash: HTreeHash,
@@ -143,6 +147,7 @@ impl<T> fmt::Debug for HTreePtr<T> {
     }
 }
 
+/// An H-Tree node, containing a list of pointers to children.
 #[repr(C, packed)]
 pub struct HTreeNode<T> {
     pub ptrs: [HTreePtr<T>; HTREE_IDX_ENTRIES],
@@ -216,6 +221,9 @@ impl<T> ops::DerefMut for HTreeNode<T> {
     }
 }
 
+/// Add a pointer to an inner H-Tree node.
+///
+/// If the node is full, it will be split, and the new sibling will be returned.
 pub fn add_inner_node<T>(
     parent: &mut HTreeNode<T>,
     new_ptr: HTreePtr<T>,
@@ -275,6 +283,9 @@ pub fn add_inner_node<T>(
     Ok(Some((htree_hash2, htree_idx2)))
 }
 
+/// Add a directory entry to a `DirList`.
+///
+/// If the list is full, it will be split, and the new sibling will be returned.
 pub fn add_dir_entry(
     dir_list: &mut DirList,
     htree_hash: &mut HTreeHash,
@@ -367,7 +378,7 @@ mod tests {
 
     #[test]
     fn htree_ptr_size_test() {
-        assert_eq!(mem::size_of::<HTreePtr<BlockRaw>>(), 20);
+        assert_eq!(mem::size_of::<HTreePtr<BlockRaw>>(), 36);
     }
 
     #[test]

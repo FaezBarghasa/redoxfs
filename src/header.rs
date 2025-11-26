@@ -5,11 +5,15 @@ use endian_num::Le;
 use aes::Aes128;
 use xts_mode::{get_tweak_default, Xts128};
 
-use crate::{AllocList, BlockPtr, KeySlot, Tree, BLOCK_SIZE, SIGNATURE, VERSION};
+use crate::{AllocList, BlockPtr, KeySlot, QuotaRoot, Tree, BLOCK_SIZE, SIGNATURE, VERSION};
 
 pub const HEADER_RING: u64 = 256;
 
-/// The header of the filesystem
+/// The header of the filesystem.
+///
+/// This struct contains all the metadata necessary to mount and use the filesystem,
+/// including the filesystem size, UUID, generation count, and pointers to the
+/// root of the file tree and allocation list.
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct Header {
@@ -27,10 +31,14 @@ pub struct Header {
     pub tree: BlockPtr<Tree>,
     /// Block of last alloc node
     pub alloc: BlockPtr<AllocList>,
+    /// Block of snapshot tree root
+    pub snapshot_tree_root: BlockPtr<Tree>,
+    /// Block of quota table root
+    pub quota_table_root: BlockPtr<QuotaRoot>,
     /// Key slots
     pub key_slots: [KeySlot; 64],
     /// Padding
-    pub padding: [u8; BLOCK_SIZE as usize - 3176],
+    pub padding: [u8; BLOCK_SIZE as usize - 3176 - 96], // Adjusted for new field size
     /// encrypted hash of header data without hash, set to hash and padded if disk is not encrypted
     pub encrypted_hash: [u8; 16],
     /// hash of header data without hash
@@ -158,8 +166,10 @@ impl Default for Header {
             generation: 0.into(),
             tree: BlockPtr::<Tree>::default(),
             alloc: BlockPtr::<AllocList>::default(),
+            snapshot_tree_root: BlockPtr::<Tree>::default(),
+            quota_table_root: BlockPtr::<QuotaRoot>::default(),
             key_slots: [KeySlot::default(); 64],
-            padding: [0; BLOCK_SIZE as usize - 3176],
+            padding: [0; BLOCK_SIZE as usize - 3176 - 96],
             encrypted_hash: [0; 16],
             hash: 0.into(),
         }
@@ -175,6 +185,7 @@ impl fmt::Debug for Header {
         let generation = self.generation;
         let tree = self.tree;
         let alloc = self.alloc;
+        let snapshot_tree_root = self.snapshot_tree_root;
         let hash = self.hash;
         f.debug_struct("Header")
             .field("signature", &signature)
@@ -184,6 +195,7 @@ impl fmt::Debug for Header {
             .field("generation", &generation)
             .field("tree", &tree)
             .field("alloc", &alloc)
+            .field("snapshot_tree_root", &snapshot_tree_root)
             .field("hash", &hash)
             .finish()
     }
