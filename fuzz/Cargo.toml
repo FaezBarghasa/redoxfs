@@ -21,6 +21,7 @@ tempfile = "3.10.1"
 
 [dependencies.redoxfs]
 path = ".."
+features = ["fuzzing", "log", "fuse"]
 
 [[bin]]
 name = "fuse_fuzz_target"

@@ -1,4 +1,3 @@
-// src/filesystem.rs
 use aes::Aes128;
 use alloc::{boxed::Box, collections::VecDeque, vec};
 use syscall::error::{Error, Result, EKEYREJECTED, ENOENT, ENOKEY, EINVAL, EIO};
@@ -16,22 +15,42 @@ fn compress_cache() -> Box<[u8]> {
 }
 
 /// A file system.
-///
-/// This struct represents the filesystem state and provides methods to open, create, and interact with the filesystem.
 pub struct FileSystem<D: Disk> {
-    //TODO: make private
-    pub disk: D,
-    //TODO: make private
-    pub block: u64,
-    //TODO: make private
-    pub header: Header,
-    pub(crate) allocator: Allocator,
+    disk: D,
+    block: u64,
+    header: Header,
+    allocator: Allocator,
     pub(crate) cipher_opt: Option<Xts128<Aes128>>,
     pub(crate) compress_cache: Box<[u8]>,
     pub(crate) mirror_enabled: bool,
 }
 
 impl<D: Disk> FileSystem<D> {
+    // Accessors for Encapsulation
+    pub fn disk(&mut self) -> &mut D {
+        &mut self.disk
+    }
+
+    pub fn block(&self) -> u64 {
+        self.block
+    }
+
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    pub fn header_mut(&mut self) -> &mut Header {
+        &mut self.header
+    }
+
+    pub fn allocator(&self) -> &Allocator {
+        &self.allocator
+    }
+
+    pub unsafe fn allocator_mut(&mut self) -> &mut Allocator {
+        &mut self.allocator
+    }
+
     /// Get diagnostics for the filesystem.
     pub fn get_diagnostics(&self) -> String {
         format!(
@@ -40,10 +59,10 @@ impl<D: Disk> FileSystem<D> {
              Allocated Blocks: {}\n\
              Free Blocks: {}\n\
              Allocator Levels: {}\n",
-             self.header.size(),
-             (self.header.size() / BLOCK_SIZE) - self.allocator.free(),
-             self.allocator.free(),
-             self.allocator.levels().len()
+            self.header.size(),
+            (self.header.size() / BLOCK_SIZE) - self.allocator.free(),
+            self.allocator.free(),
+            self.allocator.levels().len()
         )
     }
 
@@ -55,8 +74,7 @@ impl<D: Disk> FileSystem<D> {
         squash: bool,
         mirror_enabled: bool,
     ) -> Result<Self> {
-        // Phase 3.1: Recovery Logic
-        // Attempt to recover from the journal before reading the main header
+        // Recovery Logic
         if let Err(e) = Self::recover(&mut disk) {
             #[cfg(feature = "log")]
             log::warn!("Filesystem recovery failed or not needed: {:?}", e);
@@ -123,11 +141,9 @@ impl<D: Disk> FileSystem<D> {
         Err(Error::new(ENOENT))
     }
 
-    /// Recover the filesystem state by replaying valid, uncommitted journal entries.
     pub fn recover(disk: &mut D) -> Result<()> {
         let mut max_gen = 0;
         let mut best_journal_idx = None;
-        let mut best_journal_header = JournalHeader::default();
 
         for i in 0..JOURNAL_SIZE_BLOCKS {
             let block_idx = JOURNAL_START_BLOCK + i;
@@ -143,7 +159,6 @@ impl<D: Disk> FileSystem<D> {
                 if journal_header.commit_state.to_ne() == 1 && gen > max_gen {
                     max_gen = gen;
                     best_journal_idx = Some(i);
-                    best_journal_header = unsafe { core::ptr::read(journal_header) };
                 }
             }
         }
@@ -156,25 +171,15 @@ impl<D: Disk> FileSystem<D> {
         Ok(())
     }
 
-    /// Safely resize the filesystem partition.
     pub fn resize(&mut self, new_size_blocks: u64) -> Result<()> {
         let current_blocks = self.header.size() / BLOCK_SIZE;
         if new_size_blocks < current_blocks {
-            // Shrinking requires verifying no blocks are in use in the tail.
-            // Omitted for this simplified implementation.
             return Err(Error::new(EINVAL));
         }
 
         self.tx(|tx| {
-            // 1. Update Header Size
-            tx.header.size = (new_size_blocks * BLOCK_SIZE).into();
+            tx.header_mut().size = (new_size_blocks * BLOCK_SIZE).into();
             tx.header_changed = true;
-
-            // 2. Update Allocator
-            // The allocator lazily discovers free blocks, so updating the header
-            // essentially makes the new space available for future allocations.
-
-            // 3. Commit with Journal protection
             Ok(())
         })
     }
@@ -203,7 +208,6 @@ impl<D: Disk> FileSystem<D> {
         let disk_blocks = disk_size / BLOCK_SIZE;
         let block_offset = (reserved.len() as u64).div_ceil(BLOCK_SIZE);
 
-        // Need space for Reserved + HeaderRing + Journal + Initial Metadata
         if disk_blocks < (block_offset + METADATA_START_BLOCK + 4) {
             return Err(Error::new(syscall::error::ENOSPC));
         }
@@ -256,8 +260,8 @@ impl<D: Disk> FileSystem<D> {
             let alloc_free = fs_blocks - (METADATA_START_BLOCK + 3);
             alloc.data_mut().entries[0] = AllocEntry::new(METADATA_START_BLOCK + 3, alloc_free as i64);
 
-            tx.header.tree = tx.write_block(tree)?;
-            tx.header.alloc = tx.write_block(alloc)?;
+            tx.header_mut().tree = tx.write_block(tree)?;
+            tx.header_mut().alloc = tx.write_block(alloc)?;
             tx.header_changed = true;
             Ok(())
         })?;
@@ -287,19 +291,11 @@ impl<D: Disk> FileSystem<D> {
         Ok(t)
     }
 
-    pub fn allocator(&self) -> &Allocator {
-        &self.allocator
-    }
-
-    pub unsafe fn allocator_mut(&mut self) -> &mut Allocator {
-        &mut self.allocator
-    }
-
     unsafe fn reset_allocator(&mut self) -> Result<()> {
         self.allocator = Allocator::default();
         let mut allocs = VecDeque::new();
         self.tx(|tx| {
-            let mut alloc_ptr = tx.header.alloc;
+            let mut alloc_ptr = tx.header().alloc;
             while !alloc_ptr.is_null() {
                 let alloc = tx.read_block(alloc_ptr)?;
                 alloc_ptr = alloc.data().prev;

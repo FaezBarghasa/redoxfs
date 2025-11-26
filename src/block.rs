@@ -204,10 +204,9 @@ impl<T: BlockTrait> BlockData<T> {
 impl<T: ops::Deref<Target = [u8]>> BlockData<T> {
     pub fn create_ptr(&self) -> BlockPtr<T> {
         BlockPtr {
-            primary_addr: self.addr.0.into(),
-            mirror_addr: 0.into(),
+            addr: self.addr.0.into(),
             hash: seahash::hash(self.data.deref()).into(),
-            padding: 0.into(),
+            padding: [0; 16],
             phantom: PhantomData,
         }
     }
@@ -271,30 +270,26 @@ impl<T> ops::DerefMut for BlockList<T> {
 /// Also see [`BlockAddr`].
 #[repr(C, packed)]
 pub struct BlockPtr<T> {
-    pub primary_addr: Le<u64>,
-    pub mirror_addr: Le<u64>,
+    pub addr: Le<u64>,
     pub hash: Le<u64>,
-    pub padding: Le<u64>,
+    // Replaces mirror_addr and padding. Total size must remain 32 bytes.
+    // addr (8) + hash (8) + padding (16) = 32.
+    pub padding: [u8; 16],
     pub phantom: PhantomData<T>,
 }
 
 impl<T> BlockPtr<T> {
     pub fn null(meta: BlockMeta) -> Self {
         Self {
-            primary_addr: BlockAddr::null(meta).0.into(),
-            mirror_addr: BlockAddr::null(meta).0.into(),
+            addr: BlockAddr::null(meta).0.into(),
             hash: 0.into(),
-            padding: 0.into(),
+            padding: [0; 16],
             phantom: PhantomData,
         }
     }
 
     pub fn addr(&self) -> BlockAddr {
-        BlockAddr(self.primary_addr.to_ne())
-    }
-
-    pub fn mirror_addr(&self) -> BlockAddr {
-        BlockAddr(self.mirror_addr.to_ne())
+        BlockAddr(self.addr.to_ne())
     }
 
     pub fn hash(&self) -> u64 {
@@ -308,16 +303,15 @@ impl<T> BlockPtr<T> {
     pub fn marker(level: u8) -> Self {
         assert!(level <= 0xF);
         Self {
-            primary_addr: (0xFFFF_FFFF_FFFF_FFF0 | (level as u64)).into(),
-            mirror_addr: 0.into(),
+            addr: (0xFFFF_FFFF_FFFF_FFF0 | (level as u64)).into(),
             hash: u64::MAX.into(),
-            padding: 0.into(),
+            padding: [0; 16],
             phantom: PhantomData,
         }
     }
 
     pub fn is_marker(&self) -> bool {
-        (self.primary_addr.to_ne() | 0xF) == u64::MAX && self.hash.to_ne() == u64::MAX
+        (self.addr.to_ne() | 0xF) == u64::MAX && self.hash.to_ne() == u64::MAX
     }
 
     /// Cast BlockPtr to another type
@@ -326,8 +320,7 @@ impl<T> BlockPtr<T> {
     /// Unsafe because it can be used to transmute types
     pub unsafe fn cast<U>(self) -> BlockPtr<U> {
         BlockPtr {
-            primary_addr: self.primary_addr,
-            mirror_addr: self.mirror_addr,
+            addr: self.addr,
             hash: self.hash,
             padding: self.padding,
             phantom: PhantomData,
@@ -353,10 +346,9 @@ impl<T> Copy for BlockPtr<T> {}
 impl<T> Default for BlockPtr<T> {
     fn default() -> Self {
         Self {
-            primary_addr: 0.into(),
-            mirror_addr: 0.into(),
+            addr: 0.into(),
             hash: 0.into(),
-            padding: 0.into(),
+            padding: [0; 16],
             phantom: PhantomData,
         }
     }
@@ -364,12 +356,10 @@ impl<T> Default for BlockPtr<T> {
 
 impl<T> fmt::Debug for BlockPtr<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let primary_addr = self.addr();
-        let mirror_addr = self.mirror_addr();
+        let addr = self.addr();
         let hash = self.hash();
         f.debug_struct("BlockPtr")
-            .field("primary_addr", &primary_addr)
-            .field("mirror_addr", &mirror_addr)
+            .field("addr", &addr)
             .field("hash", &hash)
             .finish()
     }
