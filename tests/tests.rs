@@ -1,279 +1,135 @@
-use assert_cmd::cargo::CommandCargoExt;
-
-use core::panic::AssertUnwindSafe;
-use redoxfs::{unmount_path, DirEntry, DiskMemory, DiskSparse, FileSystem, Node, TreePtr};
-
-use std::panic::catch_unwind;
-use std::path::Path;
-use std::process::Command;
+// src/tests.rs
+use crate::htree::{HTreeHash, HTreeNode, HTreePtr, HTREE_IDX_ENTRIES};
+use crate::{
+    transaction::{level_data, level_data_mut, FsCtx},
+    BlockAddr, BlockData, BlockMeta, BlockPtr, DirEntry, DirList, DiskMemory, DiskSparse,
+    FileSystem, Node, TreePtr, ALLOC_GC_THRESHOLD, BLOCK_SIZE,
+};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
-use std::thread::sleep;
-use std::time::Duration;
-use std::{env, fs, time};
+use std::{fs, time};
 
 static IMAGE_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn with_redoxfs<T, F>(callback: F) -> T
 where
     T: Send + Sync + 'static,
-    F: FnOnce(&str) -> T + Send + Sync + 'static,
+    F: FnOnce(FileSystem<DiskSparse>) -> T + Send + Sync + 'static,
 {
     let disk_path = format!("image{}.bin", IMAGE_SEQ.fetch_add(1, Relaxed));
 
-    {
+    let res = {
         let disk = DiskSparse::create(dbg!(&disk_path), 1024 * 1024 * 1024).unwrap();
+
         let ctime = dbg!(time::SystemTime::now().duration_since(time::UNIX_EPOCH)).unwrap();
-        FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos(), false).unwrap();
-    }
-    let res = callback(&disk_path);
+        let fs = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos(), false).unwrap();
+
+        callback(fs)
+    };
 
     dbg!(fs::remove_file(dbg!(disk_path))).unwrap();
 
     res
 }
 
-fn with_mounted<T, F>(callback: F) -> T
-where
-    T: Send + Sync + 'static,
-    F: FnOnce(&Path) -> T + Send + Sync + 'static,
-{
-    let mount_path_o = format!("image{}", IMAGE_SEQ.fetch_add(1, Relaxed));
-    let mount_path = mount_path_o.clone();
+#[test]
+fn many_create_remove_should_not_increase_size() {
+    with_redoxfs(|mut fs| {
+        let initially_free = fs.allocator().free();
+        let tree_ptr = TreePtr::<Node>::root();
+        let name = "test";
 
-    let res = with_redoxfs(move |fs| {
-        // At redox, we mount on /scheme/ path, no need an empty dir
-        if cfg!(not(target_os = "redox")) {
-            if !Path::new(&mount_path).exists() {
-                dbg!(fs::create_dir(dbg!(&mount_path))).unwrap();
-            }
-        } else {
-            //FIXME: cargo_bin is broken when cross compiling. This is redoxer specific workaround
-            env::set_var(
-                "CARGO_BIN_EXE_redoxfs",
-                "/root/target/x86_64-unknown-redox/debug/redoxfs",
-            );
-        }
-        let mut mount_cmd = Command::cargo_bin("redoxfs").expect("unable to find mount bin");
-        mount_cmd.arg("-d").arg(dbg!(&fs)).arg(dbg!(&mount_path));
-        let mut child = mount_cmd.spawn().expect("mount failed to run");
-
-        let real_path = if cfg!(target_os = "redox") {
-            let real_path = dbg!(Path::new("/scheme").join(&mount_path));
-            let mut tries = 0;
-            loop {
-                if real_path.exists() {
-                    break;
-                }
-                tries += 1;
-                if tries == 10 {
-                    panic!("Fail to wait for mount")
-                }
-                println!("{tries}");
-                sleep(Duration::from_millis(500));
-            }
-            real_path
-        } else {
-            sleep(Duration::from_millis(200));
-            let r = Path::new(".").join(&mount_path);
-            r
-        };
-
-        let res = catch_unwind(AssertUnwindSafe(|| callback(&real_path)));
-
-        sleep(Duration::from_millis(200));
-
-        child.kill().expect("Can't kill");
-
-        if cfg!(target_os = "redox") {
-            unmount_path(&mount_path).unwrap();
-        } else {
-            if !dbg!(Command::new("sync").status()).unwrap().success() {
-                panic!("sync failed");
-            }
-
-            if !unmount_path(&mount_path).is_ok() {
-                // There seems to be a race condition where the device can be busy when trying to unmount.
-                // So, we pause for a moment and retry. There will still be an error output to the logs
-                // for the first failed attempt.
-                sleep(Duration::from_millis(200));
-                if !unmount_path(&mount_path).is_ok() {
-                    panic!("umount failed");
-                }
-            }
+        // Iterate over 255 times to prove deleted files don't retain space within the node tree
+        // Iterate to an ALLOC_GC_THRESHOLD boundary to ensure the allocator GC reclaims space
+        let start = fs.header().generation();
+        let end = start + ALLOC_GC_THRESHOLD;
+        let end = end - (end % ALLOC_GC_THRESHOLD) + 1 + ALLOC_GC_THRESHOLD;
+        for i in start..end {
+            let _ = fs
+                .tx(|tx| {
+                    tx.create_node(
+                        tree_ptr,
+                        &format!("{}{}", name, i),
+                        Node::MODE_FILE | 0644,
+                        1,
+                        0,
+                    )?;
+                    tx.remove_node(tree_ptr, &format!("{}{}", name, i), Node::MODE_FILE)
+                })
+                .unwrap();
         }
 
-        res.expect("Test failed")
-    });
-
-    if cfg!(not(target_os = "redox")) {
-        dbg!(fs::remove_dir(dbg!(mount_path_o))).unwrap();
-    }
-
-    res
-}
-
-#[test]
-fn simple() {
-    with_mounted(|path| {
-        dbg!(fs::create_dir(&path.join("test"))).unwrap();
-    })
-}
-
-#[test]
-fn create_and_remove_file() {
-    with_mounted(|path| {
-        let file_name = "test_file.txt";
-        let file_path = path.join(file_name);
-
-        // Create the file
-        fs::write(&file_path, "Hello, world!").unwrap();
-        assert!(fs::exists(&file_path).unwrap());
-
-        // Read the file
-        let contents = fs::read_to_string(&file_path).unwrap();
-        assert_eq!(contents, "Hello, world!");
-
-        // Remove the file
-        fs::remove_file(&file_path).unwrap();
-        assert!(!fs::exists(&file_path).unwrap());
+        // Any value greater than 0 indicates a storage leak
+        let diff = initially_free - fs.allocator().free();
+        assert_eq!(diff, 0);
     });
 }
 
 #[test]
-fn create_and_remove_directory() {
-    with_mounted(|path| {
-        let dir_name = "test_dir";
-        let dir_path = path.join(dir_name);
+fn many_create_then_many_remove_should_not_increase_size() {
+    with_redoxfs(|mut fs| {
+        let tree_ptr = TreePtr::<Node>::root();
+        let initially_free = fs.allocator().free();
+        let initial_size = fs.tx(|tx| tx.read_tree(tree_ptr)).unwrap().data().size();
 
-        // Create the directory
-        fs::create_dir(&dir_path).expect(&format!("cannot create dir {}", &dir_path.display()));
-        assert!(fs::exists(&dir_path).unwrap());
+        let end = 3000;
+        for i in 0..end {
+            let _ = fs
+                .tx(|tx| {
+                    tx.create_node(
+                        tree_ptr,
+                        &format!("test{}", i),
+                        Node::MODE_FILE | 0644,
+                        1,
+                        0,
+                    )
+                })
+                .unwrap();
+        }
 
-        // Check that the directory is empty
-        let entries: Vec<_> = fs::read_dir(&dir_path)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert!(entries.is_empty());
+        for i in 0..end {
+            let result =
+                fs.tx(|tx| tx.remove_node(tree_ptr, &format!("test{}", i), Node::MODE_FILE));
+            if result.is_err() {
+                println!("Failed to delete on iteration {i}");
+            }
+            result.unwrap();
+        }
 
-        // Add a file to the directory
-        let file_name = "test_file.txt";
-        let file_path = dir_path.join(file_name);
-        fs::write(&file_path, "Hello, world!").unwrap();
+        let final_size = fs.tx(|tx| tx.read_tree(tree_ptr)).unwrap().data().size();
+        assert_eq!(initial_size, final_size);
 
-        // Check that the dir cannot be removed when not empty
-        let error = fs::remove_dir(&dir_path);
-        assert!(error.is_err());
-        assert_eq!(
-            error.unwrap_err().kind(),
-            std::io::ErrorKind::DirectoryNotEmpty
-        );
-
-        // Remove the file
-        fs::remove_file(&file_path).unwrap();
-
-        // Remove the directory
-        fs::remove_dir(&dir_path).unwrap();
-        assert!(!fs::exists(&dir_path).unwrap());
+        // Any value greater than 0 indicates a storage leak
+        let _ = fs.tx(|tx| tx.sync(true));
+        let diff = initially_free - fs.allocator().free();
+        assert_eq!(diff, 0);
     });
 }
 
 #[test]
-fn create_and_remove_symlink() {
-    with_mounted(|path| {
-        let real_file = "real_file.txt";
-        let real_path = path.join(real_file);
-        let symlink_file = "symlink_to_real_file.txt";
-        let symlink_path = path.join(symlink_file);
-
-        // Create the real file
-        fs::write(&real_path, "Hello, world!").unwrap();
-
-        // Create the symmlink according to the platform
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real_file, &symlink_path).unwrap();
-
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&real_file, &symlink_path).unwrap();
-
-        // Check that the symlink exists and points to the correct target
-        let exists = fs::exists(&symlink_path);
-        assert!(
-            exists.is_ok() && exists.unwrap(),
-            "Symlink should exist but was: {:?}",
-            fs::exists(&symlink_path)
-        );
-        let symlink_metadata = fs::symlink_metadata(&symlink_path).unwrap();
-        assert!(symlink_metadata.file_type().is_symlink());
-        let target = fs::read_link(&symlink_path).unwrap();
-        assert_eq!(target.to_str().unwrap(), real_file);
-        assert_eq!(fs::read(&symlink_path).unwrap(), b"Hello, world!");
-
-        // Confirm the symlink cannot be removed as a directory
-        let error = fs::remove_dir(&symlink_path);
-        assert!(error.is_err());
-        assert_eq!(error.unwrap_err().kind(), std::io::ErrorKind::NotADirectory);
-
-        // Remove the symlink
-        fs::remove_file(&symlink_path).unwrap();
-        assert!(!fs::exists(&symlink_path).unwrap());
-    });
-}
-
-#[cfg(target_os = "redox")]
-#[test]
-fn mmap() {
-    //TODO
-    with_mounted(|path| {
-        use std::slice;
-
-        let path = dbg!(path.join("test"));
-
-        let mmap_inner = |write: bool| {
-            let fd = dbg!(libredox::call::open(
-                path.to_str().unwrap(),
-                libredox::flag::O_CREAT | libredox::flag::O_RDWR | libredox::flag::O_CLOEXEC,
-                0,
-            ))
+fn empty_dir() {
+    with_redoxfs(|mut fs| {
+        let root_ptr = TreePtr::root();
+        let empty_dir = fs
+            .tx(|tx| tx.create_node(root_ptr, "my_dir", Node::MODE_DIR, 1, 0))
             .unwrap();
 
-            let map = unsafe {
-                slice::from_raw_parts_mut(
-                    dbg!(libredox::call::mmap(libredox::call::MmapArgs {
-                        fd,
-                        offset: 0,
-                        length: 128,
-                        prot: libredox::flag::PROT_READ | libredox::flag::PROT_WRITE,
-                        flags: libredox::flag::MAP_SHARED,
-                        addr: core::ptr::null_mut(),
-                    }))
-                    .unwrap() as *mut u8,
-                    128,
-                )
-            };
+        // List
+        let mut children = Vec::<DirEntry>::new();
+        let _ = fs
+            .tx(|tx| tx.child_nodes(empty_dir.ptr(), &mut children))
+            .unwrap();
+        assert_eq!(children.len(), 0);
 
-            // Maps should be available after closing
-            assert_eq!(dbg!(libredox::call::close(fd)), Ok(()));
+        // Find
+        let error = fs.tx(|tx| tx.find_node(empty_dir.ptr(), "does_not_exist"));
+        assert!(error.is_err());
+        assert_eq!(error.unwrap_err().errno, syscall::error::ENOENT);
 
-            for i in 0..128 {
-                if write {
-                    map[i as usize] = i;
-                }
-                assert_eq!(map[i as usize], i);
-            }
-
-            //TODO: add msync
-            unsafe {
-                assert_eq!(
-                    dbg!(libredox::call::munmap(map.as_mut_ptr().cast(), map.len())),
-                    Ok(())
-                );
-            }
-        };
-
-        mmap_inner(true);
-        mmap_inner(false);
+        // Remove
+        let error = fs.tx(|tx| tx.remove_node(empty_dir.ptr(), "does_not_exist", Node::MODE_FILE));
+        assert!(error.is_err());
+        assert_eq!(error.unwrap_err().errno, syscall::error::ENOENT);
     })
 }
 
@@ -386,31 +242,297 @@ fn many_create_write_list_find_read_delete() {
     }
 }
 
+//
+// MARK: H-Tree tests
+//
+// Note that most of these tests use a test specific HTreeHash implementation that will simply parse the numeric
+// value after two underscores in the name. So a name of `my_file__10` would have a HTreeHash value of 10. This
+// allows for some explicit placement of test values into the H-tree.
+//
+
+/// Create an unnaturally narrow but deep H-tree structure for efficient testing of the internal
+/// algorithms used to change the H-tree state.
+fn create_minimal_l2_htree(
+    child1_name: &str,
+    mut fs: FileSystem<DiskSparse>,
+) -> (FileSystem<DiskSparse>, TreePtr<Node>) {
+    let parent_ptr = TreePtr::<Node>::root();
+    let child_ptr = fs
+        .tx(|tx| {
+            let mut parent = tx.read_tree(parent_ptr).unwrap();
+
+            let child1_block_data = BlockData::new(
+                unsafe { tx.allocate(&mut FsCtx, BlockMeta::default()) }.unwrap(),
+                Node::new(
+                    Node::MODE_FILE,
+                    parent.data().uid(),
+                    parent.data().gid(),
+                    1,
+                    0,
+                ),
+            );
+            let child1_block_ptr = unsafe { tx.write_block(child1_block_data) }.unwrap();
+            let child1_ptr = tx.insert_tree(child1_block_ptr).unwrap();
+            let child1_dir_entry = DirEntry::new(child1_ptr, child1_name);
+            let child1_htree_hash = HTreeHash::from_name(child1_name);
+
+            let mut dir_list = BlockData::<DirList>::empty(BlockAddr::default()).unwrap();
+            dir_list.data_mut().append(&child1_dir_entry);
+            let dir_ptr = tx.sync_block(&mut FsCtx, dir_list).unwrap();
+
+            let mut l1 = BlockData::<HTreeNode<DirList>>::empty(BlockAddr::default()).unwrap();
+            l1.data_mut().ptrs[0] = HTreePtr::new(child1_htree_hash, dir_ptr);
+            let l1_ptr = tx.sync_block(&mut FsCtx, l1).unwrap();
+
+            let mut l2 =
+                BlockData::<HTreeNode<HTreeNode<DirList>>>::empty(BlockAddr::default()).unwrap();
+            l2.data_mut().ptrs[0] = HTreePtr::new(child1_htree_hash, l1_ptr);
+            let l2_ptr = tx.sync_block(&mut FsCtx, l2).unwrap();
+            let l2_ptr = unsafe { l2_ptr.cast() };
+
+            level_data_mut(&mut parent)?.level0[0] = BlockPtr::marker(2);
+            level_data_mut(&mut parent)?.level0[1] = l2_ptr;
+            let size = parent.data().size() + BLOCK_SIZE * 4;
+            parent.data_mut().size = size.into();
+            tx.sync_tree(parent).unwrap();
+            Ok(child1_ptr)
+        })
+        .unwrap();
+    (fs, child_ptr)
+}
+
 #[test]
-fn many_write_read_delete_mounted() {
-    with_mounted(|path| {
-        let total_count = 500;
+fn insert_dir_entry_without_hash_change() {
+    with_redoxfs(|fs| {
+        let parent_ptr = TreePtr::<Node>::root();
 
-        for i in 0..total_count {
-            fs::write(
-                &path.join(format!("file{}", i)),
-                format!("Hello, number {i}!"),
-            )
-            .unwrap();
-        }
+        // GIVEN a directory with H-Tree populated to level 2 and a new entry that lands
+        // in the last existing DirList, but the hash sorts lower than the max hash in the DirList
+        let child1_name = "child1__9";
+        let child2_name = "child2__1";
+        let child1_htree_hash = HTreeHash::from_name(child1_name);
+        let (mut fs, child1_ptr) = create_minimal_l2_htree(child1_name, fs);
 
-        // Confirm each of the created files can be found and read
-        for i in 0..total_count {
-            let contents = fs::read_to_string(&path.join(format!("file{}", i))).unwrap();
-            assert_eq!(contents, format!("Hello, number {i}!"));
-        }
+        let _ = fs.tx(|tx| {
+            // WHEN the new child node is added to the parent directory
+            let child2_node = tx
+                .create_node(parent_ptr, child2_name, Node::MODE_FILE, 2, 0)
+                .unwrap();
 
-        // Remove all the files
-        for i in 0..total_count {
-            let file_path = path.join(format!("file{i}"));
-            assert!(fs::exists(&file_path).unwrap());
-            fs::remove_file(&file_path).unwrap();
-            assert!(!fs::exists(&file_path).unwrap());
-        }
+            // THEN the child node is added, but the H-Tree retains its structure, and the updated nodes retain
+            // the old HTreeHash value
+            let parent = tx.read_tree(parent_ptr).unwrap();
+            assert!(level_data(&parent)?.level0[0].is_marker());
+            assert_eq!(level_data(&parent)?.level0[0].addr().level().0, 2);
+
+            let l2_ptr = unsafe { level_data(&parent)?.level0[1].cast() };
+            let l2: BlockData<HTreeNode<HTreeNode<DirList>>> = tx.read_block(l2_ptr).unwrap();
+
+            let l1_ptr = l2.data().ptrs[0];
+            let l1 = tx.read_block(l1_ptr.ptr).unwrap();
+            assert_eq!(l1_ptr.htree_hash, child1_htree_hash);
+
+            let dir_list_ptr = l1.data().ptrs[0];
+            let dir_list = tx.read_block(dir_list_ptr.ptr).unwrap();
+            assert_eq!(dir_list_ptr.htree_hash, child1_htree_hash);
+
+            let mut entries: Vec<String> = dir_list
+                .data()
+                .entries()
+                .map(|e| e.name().unwrap().to_string())
+                .collect();
+            entries.sort();
+
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries, vec![child1_name, child2_name]);
+
+            // Validate listing child_nodes works
+            let mut children = Vec::new();
+            tx.child_nodes(parent_ptr, &mut children).unwrap();
+            let mut children: Vec<&str> = children.iter().map(|e| e.name().unwrap()).collect();
+            children.sort();
+            assert_eq!(children, entries);
+
+            // Validate find_node works
+            assert_eq!(
+                tx.find_node(parent_ptr, child1_name).unwrap().ptr().id(),
+                child1_ptr.id()
+            );
+            assert_eq!(
+                tx.find_node(parent_ptr, child2_name).unwrap().ptr().id(),
+                child2_node.ptr().id()
+            );
+
+            // WHEN the new child node is removed from the parent directory
+            tx.remove_node(parent_ptr, child2_name, Node::MODE_FILE)
+                .unwrap();
+
+            // THEN the child node is removed, the H-Tree retains its structure, and the updated nodes retain
+            // the old HTreeHash value
+            let parent = tx.read_tree(parent_ptr).unwrap();
+            assert!(level_data(&parent)?.level0[0].is_marker());
+            assert_eq!(level_data(&parent)?.level0[0].addr().level().0, 2);
+
+            let l2_ptr = unsafe { level_data(&parent)?.level0[1].cast() };
+            let l2: BlockData<HTreeNode<HTreeNode<DirList>>> = tx.read_block(l2_ptr).unwrap();
+
+            let l1_ptr = l2.data().ptrs[0];
+            let l1 = tx.read_block(l1_ptr.ptr).unwrap();
+            assert_eq!(l1_ptr.htree_hash, child1_htree_hash);
+
+            let dir_list_ptr = l1.data().ptrs[0];
+            let dir_list = tx.read_block(dir_list_ptr.ptr).unwrap();
+            assert_eq!(dir_list_ptr.htree_hash, child1_htree_hash);
+
+            let entries: Vec<String> = dir_list
+                .data()
+                .entries()
+                .map(|e| e.name().unwrap().to_string())
+                .collect();
+
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries, vec![child1_name]);
+
+            // Validate listing child_nodes works
+            let mut children = Vec::new();
+            tx.child_nodes(parent_ptr, &mut children).unwrap();
+            let children: Vec<&str> = children.iter().map(|e| e.name().unwrap()).collect();
+            assert_eq!(children, entries);
+
+            // Validate find_node works
+            assert_eq!(
+                tx.find_node(parent_ptr, child1_name).unwrap().ptr().id(),
+                child1_ptr.id()
+            );
+            assert_eq!(
+                tx.find_node(parent_ptr, child2_name).unwrap_err().errno,
+                syscall::error::ENOENT
+            );
+            Ok(())
+        });
     });
 }
+
+#[test]
+fn insert_dir_entry_with_hash_change() {
+    with_redoxfs(|fs| {
+        let parent_ptr = TreePtr::<Node>::root();
+
+        // GIVEN a directory with H-Tree populated to level 2 and a new entry that lands
+        // in the last existing DirList, and the hash is sorted after the max hash in the DirList
+        let child1_name = "child1__1";
+        let child2_name = "child2__9";
+        let (mut fs, child1_ptr) = create_minimal_l2_htree(child1_name, fs);
+
+        let _ = fs.tx(|tx| {
+            // WHEN the new child node is added to the parent directory
+            let child2_node = tx
+                .create_node(parent_ptr, child2_name, Node::MODE_FILE, 2, 0)
+                .unwrap();
+
+            // THEN the child node is added, the H-Tree retains its structure, and the updated nodes adopt
+            // the new HTreeHash value
+            let child2_htree_hash = HTreeHash::from_name(child2_name);
+            let parent = tx.read_tree(parent_ptr).unwrap();
+            assert!(level_data(&parent)?.level0[0].is_marker());
+            assert_eq!(level_data(&parent)?.level0[0].addr().level().0, 2);
+
+            let l2_ptr = unsafe { level_data(&parent)?.level0[1].cast() };
+            let l2: BlockData<HTreeNode<HTreeNode<DirList>>> = tx.read_block(l2_ptr).unwrap();
+
+            let l1_ptr = l2.data().ptrs[0];
+            let l1 = tx.read_block(l1_ptr.ptr).unwrap();
+            assert_eq!(l1_ptr.htree_hash, child2_htree_hash);
+
+            let dir_list_ptr = l1.data().ptrs[0];
+            let dir_list = tx.read_block(dir_list_ptr.ptr).unwrap();
+            assert_eq!(dir_list_ptr.htree_hash, child2_htree_hash);
+
+            let mut entries: Vec<String> = dir_list
+                .data()
+                .entries()
+                .map(|e| e.name().unwrap().to_string())
+                .collect();
+            entries.sort();
+
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries, vec![child1_name, child2_name]);
+
+            // Validate listing child_nodes works
+            let mut children = Vec::new();
+            tx.child_nodes(parent_ptr, &mut children).unwrap();
+            let mut children: Vec<&str> = children.iter().map(|e| e.name().unwrap()).collect();
+            children.sort();
+            assert_eq!(children, entries);
+
+            // Validate find_node works
+            assert_eq!(
+                tx.find_node(parent_ptr, child1_name).unwrap().ptr().id(),
+                child1_ptr.id()
+            );
+            assert_eq!(
+                tx.find_node(parent_ptr, child2_name).unwrap().ptr().id(),
+                child2_node.ptr().id()
+            );
+
+            // WHEN the new child node is removed from the parent directory
+            tx.remove_node(parent_ptr, child2_name, Node::MODE_FILE)
+                .unwrap();
+
+            // THEN the child node is removed, the H-Tree retains its structure, and the updated nodes revert
+            // to child1's HTreeHash value
+            let child1_htree_hash = HTreeHash::from_name(child1_name);
+            let parent = tx.read_tree(parent_ptr).unwrap();
+            assert!(level_data(&parent)?.level0[0].is_marker());
+            assert_eq!(level_data(&parent)?.level0[0].addr().level().0, 2);
+
+            let l2_ptr = unsafe { level_data(&parent)?.level0[1].cast() };
+            let l2: BlockData<HTreeNode<HTreeNode<DirList>>> = tx.read_block(l2_ptr).unwrap();
+
+            let l1_ptr = l2.data().ptrs[0];
+            let l1 = tx.read_block(l1_ptr.ptr).unwrap();
+            assert_eq!(l1_ptr.htree_hash, child1_htree_hash);
+
+            let dir_list_ptr = l1.data().ptrs[0];
+            let dir_list = tx.read_block(dir_list_ptr.ptr).unwrap();
+            assert_eq!(dir_list_ptr.htree_hash, child1_htree_hash);
+
+            let entries: Vec<String> = dir_list
+                .data()
+                .entries()
+                .map(|e| e.name().unwrap().to_string())
+                .collect();
+
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries, vec![child1_name]);
+
+            // Validate listing child_nodes works
+            let mut children = Vec::new();
+            tx.child_nodes(parent_ptr, &mut children).unwrap();
+            let children: Vec<&str> = children.iter().map(|e| e.name().unwrap()).collect();
+            assert_eq!(children, entries);
+
+            // Validate find_node works
+            assert_eq!(
+                tx.find_node(parent_ptr, child1_name).unwrap().ptr().id(),
+                child1_ptr.id()
+            );
+            assert_eq!(
+                tx.find_node(parent_ptr, child2_name).unwrap_err().errno,
+                syscall::error::ENOENT
+            );
+            Ok(())
+        });
+    });
+}
+
+#[test]
+fn delete_to_empty() {
+    with_redoxfs(|fs| {
+        let parent_ptr = TreePtr::<Node>::root();
+
+        // GIVEN a nearly empty tree
+        let child_name = "child1__9";
+        let (mut fs, _child_ptr) = create_minimal_l2_htree(child_name, fs);
+
+    // WHEN

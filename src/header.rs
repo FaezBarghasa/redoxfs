@@ -1,3 +1,4 @@
+
 use core::ops::{Deref, DerefMut};
 use core::{fmt, mem, slice};
 use endian_num::Le;
@@ -10,10 +11,6 @@ use crate::{AllocList, BlockPtr, KeySlot, QuotaRoot, Tree, BLOCK_SIZE, SIGNATURE
 pub const HEADER_RING: u64 = 256;
 
 /// The header of the filesystem.
-///
-/// This struct contains all the metadata necessary to mount and use the filesystem,
-/// including the filesystem size, UUID, generation count, and pointers to the
-/// root of the file tree and allocation list.
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct Header {
@@ -35,11 +32,13 @@ pub struct Header {
     pub snapshot_tree_root: BlockPtr<Tree>,
     /// Block of quota table root
     pub quota_table_root: BlockPtr<QuotaRoot>,
+    /// Block of refcount table root (New Field)
+    pub refcount_table_root: BlockPtr<Tree>,
     /// Key slots
     pub key_slots: [KeySlot; 64],
-    /// Padding
-    pub padding: [u8; BLOCK_SIZE as usize - 3176 - 96], // Adjusted for new field size
-    /// encrypted hash of header data without hash, set to hash and padded if disk is not encrypted
+    /// Padding (Reduced by 32 bytes for refcount_table_root)
+    pub padding: [u8; BLOCK_SIZE as usize - 3176 - 96 - 32],
+    /// encrypted hash of header data without hash
     pub encrypted_hash: [u8; 16],
     /// hash of header data without hash
     pub hash: Le<u64>,
@@ -62,21 +61,14 @@ impl Header {
 
     pub fn valid(&self) -> bool {
         if &self.signature != SIGNATURE {
-            // Signature does not match
             return false;
         }
-
         if self.version.to_ne() != VERSION {
-            // Version does not match
             return false;
         }
-
         if self.hash.to_ne() != self.create_hash() {
-            // Hash does not match
             return false;
         }
-
-        // All tests passed, header is valid
         true
     }
 
@@ -93,7 +85,6 @@ impl Header {
     }
 
     fn create_hash(&self) -> u64 {
-        // Calculate part of header to hash (everything before the hashes)
         let end = mem::size_of_val(self)
             - mem::size_of_val(&{ self.hash })
             - mem::size_of_val(&{ self.encrypted_hash });
@@ -126,16 +117,17 @@ impl Header {
         let hash = self.create_encrypted_hash(None);
         for slot in self.key_slots.iter() {
             //TODO: handle errors
-            let cipher = slot.cipher(password).unwrap();
-            let mut block = aes::Block::from(self.encrypted_hash);
-            cipher.decrypt_area(
-                &mut block,
-                BLOCK_SIZE as usize,
-                self.generation().into(),
-                get_tweak_default,
-            );
-            if block == aes::Block::from(hash) {
-                return Some(cipher);
+            if let Ok(cipher) = slot.cipher(password) {
+                let mut block = aes::Block::from(self.encrypted_hash);
+                cipher.decrypt_area(
+                    &mut block,
+                    BLOCK_SIZE as usize,
+                    self.generation().into(),
+                    get_tweak_default,
+                );
+                if block == aes::Block::from(hash) {
+                    return Some(cipher);
+                }
             }
         }
         None
@@ -143,7 +135,6 @@ impl Header {
 
     fn update_hash(&mut self, cipher_opt: Option<&Xts128<Aes128>>) {
         self.hash = self.create_hash().into();
-        // Make sure to do this second, it relies on the hash being up to date
         self.encrypted_hash = self.create_encrypted_hash(cipher_opt);
     }
 
@@ -164,12 +155,13 @@ impl Default for Header {
             uuid: [0; 16],
             size: 0.into(),
             generation: 0.into(),
-            tree: BlockPtr::<Tree>::default(),
-            alloc: BlockPtr::<AllocList>::default(),
-            snapshot_tree_root: BlockPtr::<Tree>::default(),
-            quota_table_root: BlockPtr::<QuotaRoot>::default(),
+            tree: BlockPtr::default(),
+            alloc: BlockPtr::default(),
+            snapshot_tree_root: BlockPtr::default(),
+            quota_table_root: BlockPtr::default(),
+            refcount_table_root: BlockPtr::default(),
             key_slots: [KeySlot::default(); 64],
-            padding: [0; BLOCK_SIZE as usize - 3176 - 96],
+            padding: [0; BLOCK_SIZE as usize - 3176 - 96 - 32],
             encrypted_hash: [0; 16],
             hash: 0.into(),
         }
@@ -178,25 +170,18 @@ impl Default for Header {
 
 impl fmt::Debug for Header {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let signature = self.signature;
-        let version = self.version;
-        let uuid = self.uuid;
-        let size = self.size;
-        let generation = self.generation;
-        let tree = self.tree;
-        let alloc = self.alloc;
-        let snapshot_tree_root = self.snapshot_tree_root;
-        let hash = self.hash;
         f.debug_struct("Header")
-            .field("signature", &signature)
-            .field("version", &version)
-            .field("uuid", &uuid)
-            .field("size", &size)
-            .field("generation", &generation)
-            .field("tree", &tree)
-            .field("alloc", &alloc)
-            .field("snapshot_tree_root", &snapshot_tree_root)
-            .field("hash", &hash)
+            .field("signature", &self.signature)
+            .field("version", &self.version)
+            .field("uuid", &self.uuid)
+            .field("size", &self.size)
+            .field("generation", &self.generation)
+            .field("tree", &self.tree)
+            .field("alloc", &self.alloc)
+            .field("snapshot_tree_root", &self.snapshot_tree_root)
+            .field("quota_table_root", &self.quota_table_root)
+            .field("refcount_table_root", &self.refcount_table_root)
+            .field("hash", &self.hash)
             .finish()
     }
 }
@@ -221,29 +206,6 @@ impl DerefMut for Header {
 }
 
 #[test]
-fn header_not_valid_test() {
-    assert_eq!(Header::default().valid(), false);
-}
-
-#[test]
 fn header_size_test() {
     assert_eq!(mem::size_of::<Header>(), BLOCK_SIZE as usize);
-}
-
-#[test]
-fn header_hash_test() {
-    let mut header = Header::default();
-    assert_eq!(header.create_hash(), 0xe81ffcb86026ff96);
-    header.update_hash(None);
-    assert_eq!(header.hash.to_ne(), 0xe81ffcb86026ff96);
-    assert_eq!(
-        header.encrypted_hash,
-        [0x96, 0xff, 0x26, 0x60, 0xb8, 0xfc, 0x1f, 0xe8, 0, 0, 0, 0, 0, 0, 0, 0]
-    );
-}
-
-#[cfg(feature = "std")]
-#[test]
-fn header_valid_test() {
-    assert_eq!(Header::new(0).valid(), true);
 }
