@@ -48,6 +48,16 @@ path = "src/bin/fsck.rs"
 doc = false
 required-features = ["std"]
 
+[[test]]
+name = "tests"
+path = "tests/tests.rs"
+required-features = ["std"]
+
+[[test]]
+name = "recovery"
+path = "tests/recovery.rs"
+required-features = ["std"]
+
 [dependencies]
 aes = { version = "0.8", default-features = false }
 argon2 = { version = "0.4", default-features = false, features = ["alloc"] }

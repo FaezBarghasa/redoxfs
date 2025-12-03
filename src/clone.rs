@@ -3,7 +3,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::{Disk, FileSystem, Node, Transaction, TreePtr, BLOCK_SIZE, BlockPtr, BlockTrait};
+use crate::{BlockPtr, BlockTrait, Disk, FileSystem, Node, Transaction, TreePtr, BLOCK_SIZE};
 
 fn syscall_err(err: syscall::Error) -> io::Error {
     io::Error::from_raw_os_error(err.errno)
@@ -11,35 +11,40 @@ fn syscall_err(err: syscall::Error) -> io::Error {
 
 fn tx_progress<D: Disk, F: FnMut(u64)>(tx: &mut Transaction<D>, progress: &mut F) {
     let size = tx.header().size();
-    let free = tx.allocator.free() * BLOCK_SIZE;
+    let free = tx.allocator().free() * BLOCK_SIZE;
     progress(size - free);
 }
 
 // Recursive function to increment refcounts for a metadata tree
-fn clone_ref_tree<D: Disk>(tx: &mut Transaction<D>, ptr: BlockPtr<crate::Tree>) -> syscall::Result<()> {
-    if ptr.is_null() { return Ok(()); }
+fn clone_ref_tree<D: Disk>(
+    tx: &mut Transaction<D>,
+    ptr: BlockPtr<crate::Tree>,
+) -> syscall::Result<()> {
+    if ptr.is_null() {
+        return Ok(());
+    }
 
     // Increment for the tree block itself
-    tx.allocator.increment_refcount(ptr.addr());
+    tx.allocator().increment_refcount(ptr.addr());
 
     // Read the block to find children
     let l3 = tx.read_block(ptr)?;
     for ptr in l3.data().ptrs.iter() {
         if !ptr.is_null() {
-            tx.allocator.increment_refcount(ptr.addr());
+            tx.allocator().increment_refcount(ptr.addr());
             let l2 = tx.read_block(*ptr)?;
             for ptr in l2.data().ptrs.iter() {
                 if !ptr.is_null() {
-                    tx.allocator.increment_refcount(ptr.addr());
+                    tx.allocator().increment_refcount(ptr.addr());
                     let l1 = tx.read_block(*ptr)?;
                     for ptr in l1.data().ptrs.iter() {
                         if !ptr.is_null() {
-                            tx.allocator.increment_refcount(ptr.addr());
+                            tx.allocator().increment_refcount(ptr.addr());
                             let l0 = tx.read_block(*ptr)?;
                             for ptr in l0.data().ptrs.iter() {
                                 if !ptr.is_null() {
                                     // This is the data block (Node)
-                                    tx.allocator.increment_refcount(ptr.addr());
+                                    tx.allocator().increment_refcount(ptr.addr());
                                     // We must traverse the node's data blocks too?
                                     // Yes, files share data.
                                     // This requires reading the Node and walking its level data.
@@ -73,7 +78,7 @@ fn clone_at<D: Disk, E: Disk, F: FnMut(u64)>(
         let node_ptr_old = entry.node_ptr();
         let node_old = tx_old.read_tree(node_ptr_old)?;
 
-        if tx.write_cache.len() > 64 {
+        if tx.write_cache().len() > 64 {
             tx.sync(false)?;
         }
 
@@ -126,7 +131,8 @@ pub fn clone<D: Disk, E: Disk, F: FnMut(u64)>(
             tx.header_mut().tree = tx_old.header().snapshot_tree_root;
 
             // Recursively increment refcounts for the entire tree we just pointed to
-            clone_ref_tree(&mut tx, tx.header().tree)?;
+            let tree_root = tx.header().tree;
+            clone_ref_tree(&mut tx, tree_root)?;
 
             tx.commit(true)
         } else {

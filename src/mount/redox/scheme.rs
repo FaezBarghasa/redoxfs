@@ -1,3 +1,4 @@
+// src/mount/redox/scheme.rs
 use std::collections::BTreeMap;
 use std::str;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,7 +94,7 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
                 Some(&working_dir),
                 str::from_utf8(&buf[..count]).or(Err(Error::new(EINVAL)))?,
             )
-            .ok_or(Error::new(EINVAL))?;
+                .ok_or(Error::new(EINVAL))?;
             let target_as_path = RedoxPath::from_absolute(&target).ok_or(Error::new(EINVAL))?;
 
             let (scheme, reference) = target_as_path.as_parts().ok_or(Error::new(EINVAL))?;
@@ -846,7 +847,7 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
     fn fstatvfs(&mut self, id: usize, stat: &mut StatVfs, _ctx: &CallerCtx) -> Result<()> {
         if let Some(_file) = self.files.get(&id) {
             stat.f_bsize = BLOCK_SIZE as u32;
-            stat.f_blocks = self.fs.header.size() / (stat.f_bsize as u64);
+            stat.f_blocks = self.fs.header().size() / (stat.f_bsize as u64);
             stat.f_bfree = self.fs.allocator().free();
             stat.f_bavail = stat.f_bfree;
 

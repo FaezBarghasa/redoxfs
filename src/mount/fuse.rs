@@ -106,6 +106,7 @@ fn node_attr(node: &TreeData<Node>) -> FileAttr {
 }
 
 impl<D: Disk> Filesystem for Fuse<'_, D> {
+    // ... (Methods unchanged until statfs) ...
     fn lookup(&mut self, _req: &Request, parent_id: u64, name: &OsStr, reply: ReplyEntry) {
         let parent_ptr = TreePtr::new(parent_id as u32);
         match self
@@ -326,7 +327,6 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
 
                     i += 1;
                     let _full = reply.add(
-                        //TODO: get parent?
                         parent_id,
                         i,
                         FileType::Directory,
@@ -339,7 +339,6 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 }
 
                 for child in children.iter().skip(skip) {
-                    //TODO: make it possible to get file type from directory entry
                     let node = match self.fs.tx(|tx| tx.read_tree(child.node_ptr())) {
                         Ok(ok) => ok,
                         Err(err) => {
@@ -395,7 +394,6 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
             )
         }) {
             Ok(node) => {
-                // println!("Create {:?}:{:o}:{:o}", node.1.name(), node.1.mode, mode);
                 reply.created(&TTL, &node_attr(&node), 0, 0, 0);
             }
             Err(error) => {
@@ -425,7 +423,6 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
             )
         }) {
             Ok(node) => {
-                // println!("Mkdir {:?}:{:o}:{:o}", node.1.name(), node.1.mode, mode);
                 reply.entry(&TTL, &node_attr(&node), 0);
             }
             Err(error) => {
@@ -466,7 +463,8 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
 
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
         let bsize = BLOCK_SIZE;
-        let blocks = self.fs.header.size() / bsize;
+        // Fix: Use accessor for header
+        let blocks = self.fs.header().size() / bsize;
         let bfree = self.fs.allocator().free();
         reply.statfs(blocks, bfree, bfree, 0, 0, bsize as u32, 256, 0);
     }
@@ -547,7 +545,6 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
         let new_parent_ptr = TreePtr::<Node>::new(new_parent as u32);
         let new_name = new_name.to_str().expect("name is not utf-8");
 
-        // TODO: improve performance
         match self
             .fs
             .tx(|tx| tx.rename_node(orig_parent_ptr, orig_name, new_parent_ptr, new_name))
@@ -568,50 +565,50 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
         reply: ReplyEmpty,
     ) {
         if name.to_str() == Some("system.posix_acl_access") {
-             if value.len() < 4 {
-                 reply.error(syscall::error::EINVAL);
-                 return;
-             }
-             
-             let count = (value.len() - 4) / 8;
-             if count > crate::node::ACL_ENTRIES_PER_BLOCK {
-                 reply.error(syscall::error::ENOSPC);
-                 return;
-             }
-             
-             let mut acl = crate::node::AclList::default();
-             for i in 0..count {
-                 let off = 4 + i * 8;
-                 if off + 8 > value.len() { break; }
-                 
-                 let tag = u16::from_le_bytes([value[off], value[off+1]]);
-                 let perm = u16::from_le_bytes([value[off+2], value[off+3]]);
-                 let id = u32::from_le_bytes([value[off+4], value[off+5], value[off+6], value[off+7]]);
-                 
-                 // Basic mapping
-                 let my_tag = match tag {
-                     1 => crate::node::ACL_TAG_USER, // UserObj
-                     2 => crate::node::ACL_TAG_USER, // User
-                     4 => crate::node::ACL_TAG_GROUP, // Group
-                     _ => 0,
-                 };
-                 
-                 if my_tag != 0 {
-                     acl.entries[i] = crate::node::AclEntry {
-                         tag: my_tag,
-                         id: id.into(),
-                         perms: perm.into(),
-                     };
-                 }
-             }
-             
-             let node_ptr = TreePtr::<Node>::new(node_id as u32);
-             match self.fs.tx(|tx| tx.set_acl(node_ptr, &acl)) {
-                 Ok(_) => reply.ok(),
-                 Err(e) => reply.error(e.errno),
-             }
+            if value.len() < 4 {
+                reply.error(syscall::error::EINVAL);
+                return;
+            }
+
+            let count = (value.len() - 4) / 8;
+            if count > crate::node::ACL_ENTRIES_PER_BLOCK {
+                reply.error(syscall::error::ENOSPC);
+                return;
+            }
+
+            let mut acl = crate::node::AclList::default();
+            for i in 0..count {
+                let off = 4 + i * 8;
+                if off + 8 > value.len() { break; }
+
+                let tag = u16::from_le_bytes([value[off], value[off+1]]);
+                let perm = u16::from_le_bytes([value[off+2], value[off+3]]);
+                let id = u32::from_le_bytes([value[off+4], value[off+5], value[off+6], value[off+7]]);
+
+                // Basic mapping
+                let my_tag = match tag {
+                    1 => crate::node::ACL_TAG_USER,
+                    2 => crate::node::ACL_TAG_USER,
+                    4 => crate::node::ACL_TAG_GROUP,
+                    _ => 0,
+                };
+
+                if my_tag != 0 {
+                    acl.entries[i] = crate::node::AclEntry {
+                        tag: my_tag,
+                        id: id.into(),
+                        perms: perm.into(),
+                    };
+                }
+            }
+
+            let node_ptr = TreePtr::<Node>::new(node_id as u32);
+            match self.fs.tx(|tx| tx.set_acl(node_ptr, &acl)) {
+                Ok(_) => reply.ok(),
+                Err(e) => reply.error(e.errno),
+            }
         } else {
-             reply.error(syscall::error::EOPNOTSUPP);
+            reply.error(syscall::error::EOPNOTSUPP);
         }
     }
 

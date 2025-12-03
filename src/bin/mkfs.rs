@@ -1,3 +1,4 @@
+// src/bin/mkfs.rs
 extern crate redoxfs;
 extern crate uuid;
 
@@ -102,12 +103,12 @@ fn main() {
         false,
     ) {
         Ok(filesystem) => {
-            let uuid = Uuid::from_bytes(filesystem.header.uuid());
+            let uuid = Uuid::from_bytes(filesystem.header().uuid());
             eprintln!(
                 "redoxfs-mkfs: created filesystem on {}, reserved {} blocks, size {} MB, uuid {}",
                 disk_path,
-                filesystem.block,
-                filesystem.header.size() / 1000 / 1000,
+                filesystem.block(),
+                filesystem.header().size() / 1000 / 1000,
                 uuid.hyphenated()
             );
         }

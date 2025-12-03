@@ -7,14 +7,14 @@ use uuid::Uuid;
 
 fn resize<D: Disk>(fs: &mut FileSystem<D>, size_arg: String) -> Result<(), String> {
     let disk_size = fs
-        .disk
+        .disk()
         .size()
         .map_err(|err| format!("failed to read disk size: {}", err))?;
 
     let mut last_free = None;
     let mut last_end = 0;
     fs.tx(|tx| {
-        let mut alloc_ptr = tx.header.alloc;
+        let mut alloc_ptr = tx.header().alloc;
         while !alloc_ptr.is_null() {
             let alloc = tx.read_block(alloc_ptr)?;
             alloc_ptr = alloc.data().prev;
@@ -34,13 +34,13 @@ fn resize<D: Disk>(fs: &mut FileSystem<D>, size_arg: String) -> Result<(), Strin
     })
         .map_err(|err| format!("failed to read alloc log: {}", err))?;
 
-    let old_size = fs.header.size();
+    let old_size = fs.header().size();
     let min_size = if let Some(entry) = last_free {
         entry.index() * redoxfs::BLOCK_SIZE
     } else {
         old_size
     };
-    let max_size = disk_size - (fs.block * redoxfs::BLOCK_SIZE);
+    let max_size = disk_size - (fs.block() * redoxfs::BLOCK_SIZE);
 
     let new_size = match size_arg.to_lowercase().as_str() {
         "min" | "minimum" => min_size,
@@ -119,7 +119,7 @@ fn resize<D: Disk>(fs: &mut FileSystem<D>, size_arg: String) -> Result<(), Strin
     }
 
     fs.tx(|tx| {
-        tx.header.size = new_size.into();
+        tx.header_mut().size = new_size.into();
         tx.header_changed = true;
         Ok(())
     })
@@ -174,8 +174,8 @@ fn main() {
         }
     }
 
-    let uuid = Uuid::from_bytes(fs.header.uuid());
-    let size = fs.header.size();
+    let uuid = Uuid::from_bytes(fs.header().uuid());
+    let size = fs.header().size();
     let free = fs.allocator().free() * redoxfs::BLOCK_SIZE;
     let used = size - free;
     println!("redoxfs-resize: resized filesystem on {}", disk_path);

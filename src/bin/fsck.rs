@@ -1,3 +1,4 @@
+// src/bin/fsck.rs
 use std::env;
 use std::process;
 
@@ -29,7 +30,7 @@ fn main() {
 
     println!("Filesystem open. Checking consistency...");
 
-    let header = fs.header;
+    let header = *fs.header();
     let uuid = header.uuid;
     println!("Header UUID: {:?}", uuid);
     let size = header.size;
@@ -52,6 +53,6 @@ fn main() {
             process::exit(1);
         }
     }
-    
+
     println!("FSCK complete.");
 }

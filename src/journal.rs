@@ -38,7 +38,8 @@ pub struct JournalHeader {
     pub entries: [JournalEntry; 8],
     /// Commit State: 0 = Writing (Invalid), 1 = Committed (Valid)
     pub commit_state: Le<u32>,
-    pub padding: [u8; BLOCK_SIZE as usize - 24 - (mem::size_of::<JournalEntry>() * 8)],
+    /// The size of the fields before padding is 8+8+8+192+4 = 220 bytes.
+    pub padding: [u8; BLOCK_SIZE as usize - 220],
 }
 
 impl Default for JournalHeader {
@@ -49,7 +50,7 @@ impl Default for JournalHeader {
             target_header_block: 0.into(),
             entries: [JournalEntry::default(); 8],
             commit_state: 0.into(),
-            padding: [0; BLOCK_SIZE as usize - 24 - (mem::size_of::<JournalEntry>() * 8)],
+            padding: [0; BLOCK_SIZE as usize - 220],
         }
     }
 }

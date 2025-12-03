@@ -1,14 +1,18 @@
 use aes::Aes128;
 use alloc::{boxed::Box, collections::VecDeque, vec};
-use syscall::error::{Error, Result, EKEYREJECTED, ENOENT, ENOKEY, EINVAL, EIO};
+use syscall::error::{Error, Result, EINVAL, EIO, EKEYREJECTED, ENOENT, ENOKEY};
 use xts_mode::{get_tweak_default, Xts128};
 
+use crate::{
+    journal::{
+        JournalHeader, JOURNAL_HEADER_MAGIC, JOURNAL_SIZE_BLOCKS, JOURNAL_START_BLOCK,
+        METADATA_START_BLOCK,
+    },
+    Allocator, BlockAddr, BlockLevel, BlockMeta, Disk, Header, Transaction, BLOCK_SIZE,
+    HEADER_RING, RECORD_SIZE,
+};
 #[cfg(feature = "std")]
 use crate::{AllocEntry, AllocList, BlockData, BlockTrait, Key, KeySlot, Node, Salt, TreeList};
-use crate::{
-    Allocator, BlockAddr, BlockLevel, BlockMeta, Disk, Header, Transaction, BLOCK_SIZE,
-    HEADER_RING, RECORD_SIZE, journal::{METADATA_START_BLOCK, JOURNAL_START_BLOCK, JOURNAL_SIZE_BLOCKS, JOURNAL_HEADER_MAGIC, JournalHeader},
-};
 
 fn compress_cache() -> Box<[u8]> {
     vec![0; lz4_flex::block::get_maximum_output_size(RECORD_SIZE as usize)].into_boxed_slice()
@@ -20,9 +24,8 @@ pub struct FileSystem<D: Disk> {
     block: u64,
     header: Header,
     allocator: Allocator,
-    pub(crate) cipher_opt: Option<Xts128<Aes128>>,
-    pub(crate) compress_cache: Box<[u8]>,
-    pub(crate) mirror_enabled: bool,
+    cipher_opt: Option<Xts128<Aes128>>,
+    compress_cache: Box<[u8]>,
 }
 
 impl<D: Disk> FileSystem<D> {
@@ -39,7 +42,7 @@ impl<D: Disk> FileSystem<D> {
         &self.header
     }
 
-    pub fn header_mut(&mut self) -> &mut Header {
+    pub(crate) fn header_mut(&mut self) -> &mut Header {
         &mut self.header
     }
 
@@ -47,7 +50,11 @@ impl<D: Disk> FileSystem<D> {
         &self.allocator
     }
 
-    pub unsafe fn allocator_mut(&mut self) -> &mut Allocator {
+    pub(crate) fn cipher_opt(&self) -> Option<&Xts128<Aes128>> {
+        self.cipher_opt.as_ref()
+    }
+
+    pub(crate) unsafe fn allocator_mut(&mut self) -> &mut Allocator {
         &mut self.allocator
     }
 
@@ -72,12 +79,11 @@ impl<D: Disk> FileSystem<D> {
         password_opt: Option<&[u8]>,
         block_opt: Option<u64>,
         squash: bool,
-        mirror_enabled: bool,
     ) -> Result<Self> {
         // Recovery Logic
-        if let Err(e) = Self::recover(&mut disk) {
+        if let Err(_e) = Self::recover(&mut disk) {
             #[cfg(feature = "log")]
-            log::warn!("Filesystem recovery failed or not needed: {:?}", e);
+            log::warn!("Filesystem recovery failed or not needed: {:?}", _e);
         }
 
         for ring_block in block_opt.map_or(0..65536, |x| x..x + 1) {
@@ -127,7 +133,6 @@ impl<D: Disk> FileSystem<D> {
                 allocator: Allocator::default(),
                 cipher_opt,
                 compress_cache: compress_cache(),
-                mirror_enabled,
             };
 
             unsafe { fs.reset_allocator()? };
@@ -148,11 +153,11 @@ impl<D: Disk> FileSystem<D> {
         for i in 0..JOURNAL_SIZE_BLOCKS {
             let block_idx = JOURNAL_START_BLOCK + i;
             let mut buffer = [0u8; BLOCK_SIZE as usize];
-            unsafe { disk.read_at(block_idx, &mut buffer)?; }
+            unsafe {
+                disk.read_at(block_idx, &mut buffer)?;
+            }
 
-            let journal_header: &JournalHeader = unsafe {
-                core::mem::transmute(buffer.as_ptr())
-            };
+            let journal_header: &JournalHeader = unsafe { core::mem::transmute(buffer.as_ptr()) };
 
             if journal_header.magic.to_ne() == JOURNAL_HEADER_MAGIC {
                 let gen = journal_header.generation.to_ne();
@@ -163,9 +168,36 @@ impl<D: Disk> FileSystem<D> {
             }
         }
 
-        if let Some(_idx) = best_journal_idx {
+        if let Some(idx) = best_journal_idx {
             #[cfg(feature = "log")]
             log::info!("Recovering from journal generation {}", max_gen);
+            let journal_block_idx = JOURNAL_START_BLOCK + idx;
+            let mut buffer = [0u8; BLOCK_SIZE as usize];
+            unsafe {
+                disk.read_at(journal_block_idx, &mut buffer)?;
+            }
+            let journal_header: &JournalHeader = unsafe { core::mem::transmute(buffer.as_ptr()) };
+
+            // Replay the journal entries
+            for (i, entry) in journal_header.entries.iter().enumerate() {
+                if entry.block_index.to_ne() == 0 {
+                    continue;
+                }
+                let data_block_idx = journal_block_idx + 1 + i as u64;
+                let mut data_buffer = [0u8; BLOCK_SIZE as usize];
+                unsafe {
+                    disk.read_at(data_block_idx, &mut data_buffer)?;
+                    disk.write_at(entry.block_index.to_ne(), &data_buffer)?;
+                }
+            }
+
+            // Checkpoint: Write the recovered header
+            let target_header_block = journal_header.target_header_block.to_ne();
+            let mut header_buffer = [0u8; BLOCK_SIZE as usize];
+            unsafe {
+                disk.read_at(journal_block_idx + 1, &mut header_buffer)?; // Assuming header is the first entry
+                disk.write_at(target_header_block, &header_buffer)?;
+            }
         }
 
         Ok(())
@@ -179,7 +211,7 @@ impl<D: Disk> FileSystem<D> {
 
         self.tx(|tx| {
             tx.header_mut().size = (new_size_blocks * BLOCK_SIZE).into();
-            tx.header_changed = true;
+            tx.set_header_changed(true);
             Ok(())
         })
     }
@@ -190,9 +222,8 @@ impl<D: Disk> FileSystem<D> {
         password_opt: Option<&[u8]>,
         ctime: u64,
         ctime_nsec: u32,
-        mirror_enabled: bool,
     ) -> Result<Self> {
-        Self::create_reserved(disk, password_opt, &[], ctime, ctime_nsec, mirror_enabled)
+        Self::create_reserved(disk, password_opt, &[], ctime, ctime_nsec)
     }
 
     #[cfg(feature = "std")]
@@ -202,7 +233,6 @@ impl<D: Disk> FileSystem<D> {
         reserved: &[u8],
         ctime: u64,
         ctime_nsec: u32,
-        mirror_enabled: bool,
     ) -> Result<Self> {
         let disk_size = disk.size()?;
         let disk_blocks = disk_size / BLOCK_SIZE;
@@ -220,7 +250,9 @@ impl<D: Disk> FileSystem<D> {
                 data[i] = reserved[block * BLOCK_SIZE as usize + i];
                 i += 1;
             }
-            unsafe { disk.write_at(block as u64, &data)?; }
+            unsafe {
+                disk.write_at(block as u64, &data)?;
+            }
         }
 
         let mut header = Header::new(fs_blocks * BLOCK_SIZE);
@@ -230,7 +262,8 @@ impl<D: Disk> FileSystem<D> {
                     password,
                     Salt::new().unwrap(),
                     (Key::new().unwrap(), Key::new().unwrap()),
-                ).unwrap();
+                )
+                .unwrap();
                 Some(header.key_slots[0].cipher(password).unwrap())
             }
             None => None,
@@ -243,10 +276,11 @@ impl<D: Disk> FileSystem<D> {
             allocator: Allocator::default(),
             cipher_opt,
             compress_cache: compress_cache(),
-            mirror_enabled,
         };
 
-        unsafe { fs.disk.write_at(fs.block, &fs.header)?; }
+        unsafe {
+            fs.disk.write_at(fs.block, &fs.header)?;
+        }
 
         fs.tx(|tx| unsafe {
             let tree = BlockData::new(
@@ -258,15 +292,16 @@ impl<D: Disk> FileSystem<D> {
                 AllocList::empty(BlockLevel::default()).unwrap(),
             );
             let alloc_free = fs_blocks - (METADATA_START_BLOCK + 3);
-            alloc.data_mut().entries[0] = AllocEntry::new(METADATA_START_BLOCK + 3, alloc_free as i64);
+            alloc.data_mut().entries[0] =
+                AllocEntry::new(METADATA_START_BLOCK + 3, alloc_free as i64);
 
             tx.header_mut().tree = tx.write_block(tree)?;
             tx.header_mut().alloc = tx.write_block(alloc)?;
-            tx.header_changed = true;
+            tx.set_header_changed(true);
             Ok(())
         })?;
 
-        unsafe { fs.reset_allocator()?; }
+        unsafe { fs.reset_allocator()? };
 
         fs.tx(|tx| unsafe {
             let mut root = BlockData::new(

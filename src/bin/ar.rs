@@ -1,3 +1,4 @@
+// src/bin/ar.rs
 extern crate redoxfs;
 extern crate syscall;
 extern crate uuid;
@@ -81,7 +82,7 @@ fn main() {
                 }
             };
 
-            if let Err(err) = fs.disk.file.set_len(size) {
+            if let Err(err) = fs.disk().file.set_len(size) {
                 println!(
                     "redoxfs-ar: failed to truncate {} to {}: {}",
                     disk_path, size, err
@@ -89,12 +90,12 @@ fn main() {
                 process::exit(1);
             }
 
-            let uuid = Uuid::from_bytes(fs.header.uuid());
+            let uuid = Uuid::from_bytes(fs.header().uuid());
             println!(
                 "redoxfs-ar: created filesystem on {}, reserved {} blocks, size {} MB, uuid {}",
                 disk_path,
-                fs.block,
-                fs.header.size() / 1000 / 1000,
+                fs.block(),
+                fs.header().size() / 1000 / 1000,
                 uuid.hyphenated()
             );
         }

@@ -206,7 +206,6 @@ impl<T: ops::Deref<Target = [u8]>> BlockData<T> {
         BlockPtr {
             addr: self.addr.0.into(),
             hash: seahash::hash(self.data.deref()).into(),
-            padding: [0; 16],
             phantom: PhantomData,
         }
     }
@@ -272,9 +271,6 @@ impl<T> ops::DerefMut for BlockList<T> {
 pub struct BlockPtr<T> {
     pub addr: Le<u64>,
     pub hash: Le<u64>,
-    // Replaces mirror_addr and padding. Total size must remain 32 bytes.
-    // addr (8) + hash (8) + padding (16) = 32.
-    pub padding: [u8; 16],
     pub phantom: PhantomData<T>,
 }
 
@@ -283,7 +279,6 @@ impl<T> BlockPtr<T> {
         Self {
             addr: BlockAddr::null(meta).0.into(),
             hash: 0.into(),
-            padding: [0; 16],
             phantom: PhantomData,
         }
     }
@@ -305,7 +300,6 @@ impl<T> BlockPtr<T> {
         Self {
             addr: (0xFFFF_FFFF_FFFF_FFF0 | (level as u64)).into(),
             hash: u64::MAX.into(),
-            padding: [0; 16],
             phantom: PhantomData,
         }
     }
@@ -322,7 +316,6 @@ impl<T> BlockPtr<T> {
         BlockPtr {
             addr: self.addr,
             hash: self.hash,
-            padding: self.padding,
             phantom: PhantomData,
         }
     }
@@ -348,7 +341,6 @@ impl<T> Default for BlockPtr<T> {
         Self {
             addr: 0.into(),
             hash: 0.into(),
-            padding: [0; 16],
             phantom: PhantomData,
         }
     }

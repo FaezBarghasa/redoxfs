@@ -1,3 +1,4 @@
+// src/bin/clone.rs
 extern crate redoxfs;
 extern crate syscall;
 extern crate uuid;
@@ -113,7 +114,7 @@ fn main() {
         }
     };
 
-    let size_old = fs_old.header.size();
+    let size_old = fs_old.header().size();
     let free_old = fs_old.allocator().free() * redoxfs::BLOCK_SIZE;
     let used_old = size_old - free_old;
     let mut last_percent = 0;
@@ -141,12 +142,12 @@ fn main() {
         }
     }
 
-    let uuid = Uuid::from_bytes(fs.header.uuid());
-    let size = fs.header.size();
+    let uuid = Uuid::from_bytes(fs.header().uuid());
+    let size = fs.header().size();
     let free = fs.allocator().free() * redoxfs::BLOCK_SIZE;
     let used = size - free;
     println!("redoxfs-clone: created filesystem on {}", disk_path,);
-    println!("\treserved: {} blocks", fs.block);
+    println!("\treserved: {} blocks", fs.block());
     println!("\tuuid: {}", uuid.hyphenated());
     println!("\tsize: {} MB", size / 1000 / 1000);
     println!("\tused: {} MB", used / 1000 / 1000);

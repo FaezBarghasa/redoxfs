@@ -1,3 +1,4 @@
+// src/bin/mount.rs
 extern crate libc;
 extern crate redoxfs;
 #[cfg(target_os = "redox")]
@@ -81,13 +82,13 @@ fn bootloader_password() -> Option<Vec<u8>> {
         addr_env.to_str().expect("REDOXFS_PASSWORD_ADDR not valid"),
         16,
     )
-    .expect("failed to parse REDOXFS_PASSWORD_ADDR");
+        .expect("failed to parse REDOXFS_PASSWORD_ADDR");
 
     let size = usize::from_str_radix(
         size_env.to_str().expect("REDOXFS_PASSWORD_SIZE not valid"),
         16,
     )
-    .expect("failed to parse REDOXFS_PASSWORD_SIZE");
+        .expect("failed to parse REDOXFS_PASSWORD_SIZE");
 
     let mut password = Vec::with_capacity(size);
     unsafe {
@@ -104,8 +105,8 @@ fn bootloader_password() -> Option<Vec<u8>> {
             fd: fd.raw(),
             offset: addr as u64,
         })
-        .expect("failed to map REDOXFS_PASSWORD")
-        .cast::<u8>();
+            .expect("failed to map REDOXFS_PASSWORD")
+            .cast::<u8>();
 
         for i in 0..size {
             password.push(password_map.add(i).read());
@@ -173,7 +174,7 @@ fn filesystem_by_path(
                         log::debug!(
                             "opened filesystem on {} with uuid {}",
                             path,
-                            Uuid::from_bytes(filesystem.header.uuid()).hyphenated()
+                            Uuid::from_bytes(filesystem.header().uuid()).hyphenated()
                         );
 
                         return Some((path.to_string(), filesystem));
@@ -242,7 +243,7 @@ fn filesystem_by_uuid(
                                                 if let Some((path, filesystem)) =
                                                     filesystem_by_path(&path, block_opt, false)
                                                 {
-                                                    if &filesystem.header.uuid() == uuid.as_bytes()
+                                                    if &filesystem.header().uuid() == uuid.as_bytes()
                                                     {
                                                         log::debug!(
                                                             "filesystem on {} matches uuid {}",

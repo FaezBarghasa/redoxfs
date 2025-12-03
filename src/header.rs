@@ -1,4 +1,3 @@
-
 use core::ops::{Deref, DerefMut};
 use core::{fmt, mem, slice};
 use endian_num::Le;
@@ -170,18 +169,24 @@ impl Default for Header {
 
 impl fmt::Debug for Header {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Copy values from packed struct fields to avoid unaligned references
+        let version = self.version.to_ne();
+        let size = self.size.to_ne();
+        let generation = self.generation.to_ne();
+        let hash = self.hash.to_ne();
+
         f.debug_struct("Header")
             .field("signature", &self.signature)
-            .field("version", &self.version)
+            .field("version", &version)
             .field("uuid", &self.uuid)
-            .field("size", &self.size)
-            .field("generation", &self.generation)
+            .field("size", &size)
+            .field("generation", &generation)
             .field("tree", &self.tree)
             .field("alloc", &self.alloc)
             .field("snapshot_tree_root", &self.snapshot_tree_root)
             .field("quota_table_root", &self.quota_table_root)
             .field("refcount_table_root", &self.refcount_table_root)
-            .field("hash", &self.hash)
+            .field("hash", &hash)
             .finish()
     }
 }

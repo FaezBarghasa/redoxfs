@@ -184,11 +184,6 @@ impl Allocator {
     /// Deallocate the given block.
     /// Only actually returns the block to the free list if the refcount reaches 0.
     pub fn deallocate(&mut self, addr: BlockAddr) {
-        // Check refcount before freeing
-        if self.decrement_refcount(addr) > 0 {
-            return;
-        }
-
         let mut index = addr.index();
         let mut level = addr.level().0;
 
