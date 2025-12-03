@@ -83,6 +83,7 @@ pub struct Transaction<'a, D: Disk> {
     allocator_log: VecDeque<AllocEntry>,
     deallocate: Vec<BlockAddr>,
     write_cache: BTreeMap<BlockAddr, Box<[u8]>>,
+    shadow_cache: BTreeMap<BlockAddr, Box<[u8]>>,
 }
 
 impl<'a, D: Disk> Transaction<'a, D> {
@@ -97,6 +98,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
             allocator_log: VecDeque::new(),
             deallocate: Vec::new(),
             write_cache: BTreeMap::new(),
+            shadow_cache: BTreeMap::new(),
         }
     }
 
@@ -120,8 +122,51 @@ impl<'a, D: Disk> Transaction<'a, D> {
         self.header_changed = changed;
     }
 
-    pub fn commit(self, _squash: bool) -> Result<()> {
+    pub fn commit(mut self, squash: bool) -> Result<()> {
+        // Finalize CoW changes
+        for (old_addr, _original_data) in self.shadow_cache.iter() {
+            // The new block is in write_cache, the old one is here.
+            // Deallocate the original block.
+            unsafe { self.deallocate(&mut FsCtx, *old_addr) };
+        }
         self.journal_commit()
+    }
+
+    pub fn rollback(self) -> Result<()> {
+        // Discard write_cache, restore shadow_cache
+        for (addr, data) in self.shadow_cache.iter() {
+            unsafe {
+                self.fs.disk.write_at(self.fs.block + addr.index(), &data)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn shadow_block<T: BlockTrait + DerefMut<Target = [u8]>>(
+        &mut self,
+        ptr: BlockPtr<T>,
+    ) -> Result<BlockData<T>> {
+        let mut block = self.read_block(ptr)?;
+        if self.shadow_cache.contains_key(&ptr.addr()) {
+            // Already shadowed
+            return Ok(block);
+        }
+
+        self.shadow_cache
+            .insert(ptr.addr(), block.data().to_vec().into_boxed_slice());
+
+        // Allocate a new block and move the data.
+        let old_addr = ptr.addr();
+        let new_addr = self
+            .allocator
+            .allocate(old_addr.level())
+            .ok_or(Error::new(ENOSPC))?;
+        block.data_mut().set_addr(new_addr);
+
+        // Deallocate the old block
+        self.deallocate(&mut FsCtx, old_addr);
+
+        Ok(block)
     }
 
     pub(crate) unsafe fn write_block<T: BlockTrait + Deref<Target = [u8]>>(
@@ -158,11 +203,17 @@ impl<'a, D: Disk> Transaction<'a, D> {
             if block.create_ptr().hash() == ptr.hash() {
                 return Ok(block);
             }
+        } else if let Some(raw) = self.shadow_cache.get(&ptr.addr()) {
+            data.copy_from_slice(raw);
+            let block = BlockData::new(ptr.addr(), data);
+            if block.create_ptr().hash() == ptr.hash() {
+                return Ok(block);
+            }
         } else {
             let block_offset = self.fs.block();
             unsafe {
                 self.fs.disk().read_at_with_hint(
-                    block_offset + ptr.addr().index(),
+                    block_offset + ptr.addr.index(),
                     &mut data,
                     hint,
                 )?;
@@ -206,15 +257,19 @@ impl<'a, D: Disk> Transaction<'a, D> {
         };
 
         let mut journal_data_block = journal_block + 1;
-        for (addr, raw) in self.write_cache.iter_mut() {
+        for (i, (addr, raw)) in self.write_cache.iter_mut().enumerate() {
+            if i >= crate::journal::MAX_JOURNAL_ENTRIES {
+                // Should not happen with proper transaction splitting
+                return Err(Error::new(ENOSPC));
+            }
+
             self.fs.encrypt(raw, *addr);
             let entry = JournalEntry {
                 block_index: (*addr).index().into(),
                 generation: next_gen.into(),
                 hash: BlockData::hash(raw).into(),
             };
-            journal_header.entries[journal_data_block as usize - (journal_block as usize + 1)] =
-                entry;
+            journal_header.entries[i] = entry;
             unsafe {
                 self.fs
                     .disk()
@@ -240,11 +295,14 @@ impl<'a, D: Disk> Transaction<'a, D> {
                 &journal_header.commit_state as *const _ as usize - &journal_header as *const _ as usize;
             self.fs
                 .disk()
-                .write_at(journal_block, &commit_state_bytes)?
+                .write_at_part(journal_block, &commit_state_bytes, offset, commit_state_bytes.len())?
         }
 
         // Checkpoint: Write data to their final locations
-        for (addr, raw) in self.write_cache.iter() {
+        for (i, (addr, raw)) in self.write_cache.iter().enumerate() {
+            if i >= crate::journal::MAX_JOURNAL_ENTRIES {
+                break;
+            }
             unsafe {
                 self.fs
                     .disk()
@@ -270,11 +328,68 @@ impl<'a, D: Disk> Transaction<'a, D> {
         Ok(())
     }
 
-    fn sync_allocator(&mut self, _force_squash: bool) -> Result<bool> {
-        // ... logic as before ...
-        // Ensure we use self.write_block, which is safe.
-        // ...
-        Ok(true)
+    fn sync_allocator(&mut self, force_squash: bool) -> Result<bool> {
+        let mut changed = false;
+        let mut alloc_ptr = self.header.alloc;
+        let mut allocs = VecDeque::new();
+
+        while !alloc_ptr.is_null() {
+            let alloc = self.read_block(alloc_ptr)?;
+            alloc_ptr = alloc.data().prev;
+            allocs.push_front(alloc);
+        }
+
+        let gc_threshold = if force_squash {
+            0
+        } else {
+            ALLOC_GC_THRESHOLD
+        };
+
+        if self.deallocate.len() > gc_threshold {
+            changed = true;
+
+            let mut deallocated = 0;
+            'deallocate: while let Some(addr) = self.deallocate.pop() {
+                for alloc in allocs.iter_mut() {
+                    if alloc.data_mut().deallocate(addr) {
+                        deallocated += 1;
+                        continue 'deallocate;
+                    }
+                }
+            }
+        }
+
+        if !self.allocator_log.is_empty() {
+            changed = true;
+            'allocator_log: while let Some(entry) = self.allocator_log.pop_front() {
+                for alloc in allocs.iter_mut() {
+                    if alloc.data_mut().insert_entry(entry) {
+                        continue 'allocator_log;
+                    }
+                }
+
+                let mut alloc = unsafe {
+                    let mut alloc = self.read_block(self.header.alloc)?;
+                    alloc.data_mut().prev = self.header.alloc;
+                    self.shadow_block(alloc.ptr())?
+                };
+
+                assert!(alloc.data_mut().insert_entry(entry));
+                allocs.push_back(alloc);
+            }
+        }
+
+        if changed {
+            let mut next_ptr = BlockPtr::default();
+            for mut alloc in allocs.into_iter().rev() {
+                alloc.data_mut().next = next_ptr;
+                next_ptr = unsafe { self.write_block(alloc)? };
+            }
+            self.header_mut().alloc = next_ptr;
+            self.set_header_changed(true);
+        }
+
+        Ok(changed)
     }
 
     pub(crate) unsafe fn deallocate(&mut self, ctx: &mut dyn AllocCtx, addr: BlockAddr) {
@@ -319,12 +434,105 @@ impl<'a, D: Disk> Transaction<'a, D> {
         let l1 = self.read_block(l2.data().ptrs[i2])?;
         let l0 = self.read_block(l1.data().ptrs[i1])?;
         let raw = self.read_block(l0.data().ptrs[i0])?;
-        let mut data = T::empty(BlockLevel::default()).ok_or(Error::new(ENOENT))?;
+        let mut data = T::empty(raw.addr().level()).ok_or(Error::new(ENOENT))?;
         data.copy_from_slice(raw.data());
         Ok(TreeData::new(ptr.id(), data))
     }
 
-    pub fn sync_tree<T: Deref<Target = [u8]>>(&mut self, _node: TreeData<T>) -> Result<()> {
+    pub fn sync_tree<T: BlockTrait + DerefMut<Target = [u8]> + Deref<Target = [u8]>>(
+        &mut self,
+        mut node: TreeData<T>,
+    ) -> Result<()> {
+        let (i3, i2, i1, i0) = node.ptr().indexes();
+
+        unsafe {
+            let mut l3 = self.read_block(self.header.tree)?;
+            let mut l2 = self.read_block(l3.data().ptrs[i3])?;
+            let mut l1 = self.read_block(l2.data().ptrs[i2])?;
+            let mut l0 = self.read_block(l1.data().ptrs[i1])?;
+
+            let raw_ptr = self.write_block(BlockData::new(
+                l0.data().ptrs[i0].addr(),
+                node.data_mut(),
+            ))?;
+            l0.data_mut().ptrs[i0] = raw_ptr;
+
+            let l0_ptr = self.write_block(l0)?;
+            l1.data_mut().ptrs[i1] = l0_ptr;
+
+            let l1_ptr = self.write_block(l1)?;
+            l2.data_mut().ptrs[i2] = l1_ptr;
+
+            let l2_ptr = self.write_block(l2)?;
+            l3.data_mut().ptrs[i3] = l2_ptr;
+
+            self.header_mut().tree = self.write_block(l3)?;
+        }
+
+        self.set_header_changed(true);
+        Ok(())
+    }
+
+    pub fn insert_tree<T: BlockTrait + DerefMut<Target = [u8]> + Deref<Target = [u8]>>(
+        &mut self,
+        node: BlockPtr<T>,
+    ) -> Result<TreePtr<T>> {
+        let (i3, i2, i1, i0) = TreePtr::<T>::next_id(self.header.unalloc_ptr);
+
+        unsafe {
+            let mut l3 = self.shadow_block(self.header.tree)?;
+            let mut l2 = self.shadow_block(l3.data().ptrs[i3])?;
+            let mut l1 = self.shadow_block(l2.data().ptrs[i2])?;
+            let mut l0 = self.shadow_block(l1.data().ptrs[i1])?;
+
+            l0.data_mut().ptrs[i0] = node;
+
+            let l0_ptr = self.write_block(l0)?;
+            l1.data_mut().ptrs[i1] = l0_ptr;
+
+            let l1_ptr = self.write_block(l1)?;
+            l2.data_mut().ptrs[i2] = l1_ptr;
+
+            let l2_ptr = self.write_block(l2)?;
+            l3.data_mut().ptrs[i3] = l2_ptr;
+
+            self.header_mut().tree = self.write_block(l3)?;
+        }
+
+        self.header_mut().unalloc_ptr = TreePtr::new(i3, i2, i1, i0).next().unwrap().into();
+        self.set_header_changed(true);
+
+        Ok(TreePtr::new(i3, i2, i1, i0))
+    }
+
+    pub fn remove_tree<T: BlockTrait + DerefMut<Target = [u8]>>(
+        &mut self,
+        ptr: TreePtr<T>,
+    ) -> Result<()> {
+        let (i3, i2, i1, i0) = ptr.indexes();
+
+        unsafe {
+            let mut l3 = self.shadow_block(self.header.tree)?;
+            let mut l2 = self.shadow_block(l3.data().ptrs[i3])?;
+            let mut l1 = self.shadow_block(l2.data().ptrs[i2])?;
+            let mut l0 = self.shadow_block(l1.data().ptrs[i1])?;
+
+            let node_ptr = l0.data().ptrs[i0];
+            self.deallocate(&mut FsCtx, node_ptr.addr());
+            l0.data_mut().ptrs[i0] = BlockPtr::default();
+
+            let l0_ptr = self.write_block(l0)?;
+            l1.data_mut().ptrs[i1] = l0_ptr;
+
+            let l1_ptr = self.write_block(l1)?;
+            l2.data_mut().ptrs[i2] = l1_ptr;
+
+            let l2_ptr = self.write_block(l2)?;
+            l3.data_mut().ptrs[i3] = l2_ptr;
+
+            self.header_mut().tree = self.write_block(l3)?;
+        }
+
         self.set_header_changed(true);
         Ok(())
     }

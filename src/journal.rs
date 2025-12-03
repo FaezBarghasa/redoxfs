@@ -14,6 +14,9 @@ pub const JOURNAL_HEADER_MAGIC: u64 = 0xDEADBEEF00F5C0FE;
 /// The static metadata blocks (Tree, Alloc, Root) start after the journal.
 pub const METADATA_START_BLOCK: u64 = JOURNAL_START_BLOCK + JOURNAL_SIZE_BLOCKS;
 
+const JOURNAL_HEADER_STATIC_SIZE: usize = mem::size_of::<Le<u64>>() * 3 + mem::size_of::<Le<u32>>();
+pub const MAX_JOURNAL_ENTRIES: usize = (BLOCK_SIZE as usize - JOURNAL_HEADER_STATIC_SIZE) / mem::size_of::<JournalEntry>();
+
 /// Represents a single metadata block update within a transaction.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -35,11 +38,11 @@ pub struct JournalHeader {
     /// Block index where the primary Header will be written after journaling.
     pub target_header_block: Le<u64>,
     /// Critical metadata pointers to restore
-    pub entries: [JournalEntry; 8],
+    pub entries: [JournalEntry; MAX_JOURNAL_ENTRIES],
     /// Commit State: 0 = Writing (Invalid), 1 = Committed (Valid)
     pub commit_state: Le<u32>,
     /// The size of the fields before padding is 8+8+8+192+4 = 220 bytes.
-    pub padding: [u8; BLOCK_SIZE as usize - 220],
+    pub padding: [u8; BLOCK_SIZE as usize - (JOURNAL_HEADER_STATIC_SIZE + MAX_JOURNAL_ENTRIES * mem::size_of::<JournalEntry>())],
 }
 
 impl Default for JournalHeader {
@@ -48,9 +51,9 @@ impl Default for JournalHeader {
             magic: 0.into(),
             generation: 0.into(),
             target_header_block: 0.into(),
-            entries: [JournalEntry::default(); 8],
+            entries: [JournalEntry::default(); MAX_JOURNAL_ENTRIES],
             commit_state: 0.into(),
-            padding: [0; BLOCK_SIZE as usize - 220],
+            padding: [0; BLOCK_SIZE as usize - (JOURNAL_HEADER_STATIC_SIZE + MAX_JOURNAL_ENTRIES * mem::size_of::<JournalEntry>())],
         }
     }
 }

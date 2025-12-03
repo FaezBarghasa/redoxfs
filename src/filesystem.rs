@@ -1,5 +1,6 @@
 use aes::Aes128;
-use alloc::{boxed::Box, collections::VecDeque, vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec};
+use spin::Mutex;
 use syscall::error::{Error, Result, EINVAL, EIO, EKEYREJECTED, ENOENT, ENOKEY};
 use xts_mode::{get_tweak_default, Xts128};
 
@@ -79,9 +80,9 @@ impl<D: Disk> FileSystem<D> {
         password_opt: Option<&[u8]>,
         block_opt: Option<u64>,
         squash: bool,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Mutex<Self>>> {
         // Recovery Logic
-        if let Err(_e) = Self::recover(&mut disk) {
+        if let Err(_e) = Self::recover_journal(&mut disk) {
             #[cfg(feature = "log")]
             log::warn!("Filesystem recovery failed or not needed: {:?}", _e);
         }
@@ -135,18 +136,21 @@ impl<D: Disk> FileSystem<D> {
                 compress_cache: compress_cache(),
             };
 
+            let fs_mux = Arc::new(Mutex::new(fs));
+            let mut fs = fs_mux.lock();
+
             unsafe { fs.reset_allocator()? };
 
             // Squash allocations and sync
-            Transaction::new(&mut fs).commit(squash)?;
+            fs.tx(|tx| tx.commit(squash))?;
 
-            return Ok(fs);
+            return Ok(fs_mux.clone());
         }
 
         Err(Error::new(ENOENT))
     }
 
-    pub fn recover(disk: &mut D) -> Result<()> {
+    pub fn recover_journal(disk: &mut D) -> Result<()> {
         let mut max_gen = 0;
         let mut best_journal_idx = None;
 
@@ -187,16 +191,33 @@ impl<D: Disk> FileSystem<D> {
                 let mut data_buffer = [0u8; BLOCK_SIZE as usize];
                 unsafe {
                     disk.read_at(data_block_idx, &mut data_buffer)?;
+                    // TODO: Verify hash
                     disk.write_at(entry.block_index.to_ne(), &data_buffer)?;
                 }
             }
 
             // Checkpoint: Write the recovered header
-            let target_header_block = journal_header.target_header_block.to_ne();
-            let mut header_buffer = [0u8; BLOCK_SIZE as usize];
+            let mut main_header_bytes = [0u8; BLOCK_SIZE as usize];
+            let mut final_header = Header::default();
             unsafe {
-                disk.read_at(journal_block_idx + 1, &mut header_buffer)?; // Assuming header is the first entry
-                disk.write_at(target_header_block, &header_buffer)?;
+                // This assumes the header is the first entry, which is a fragile assumption.
+                // A better approach would be to store the header separately or identify it.
+                disk.read_at(journal_block_idx + 1, &mut main_header_bytes)?;
+                let temp_header: &Header = core::mem::transmute(main_header_bytes.as_ptr());
+                final_header = temp_header.clone();
+                final_header.generation = max_gen.into();
+
+                disk.write_at(
+                    journal_header.target_header_block.to_ne(),
+                    &final_header,
+                )?;
+            }
+
+            // Clear the journal entry
+            let mut cleared_header = journal_header.clone();
+            cleared_header.commit_state = 0.into();
+            unsafe {
+                disk.write_at(journal_block_idx, &cleared_header)?;
             }
         }
 
@@ -222,7 +243,7 @@ impl<D: Disk> FileSystem<D> {
         password_opt: Option<&[u8]>,
         ctime: u64,
         ctime_nsec: u32,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Mutex<Self>>> {
         Self::create_reserved(disk, password_opt, &[], ctime, ctime_nsec)
     }
 
@@ -233,7 +254,7 @@ impl<D: Disk> FileSystem<D> {
         reserved: &[u8],
         ctime: u64,
         ctime_nsec: u32,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Mutex<Self>>> {
         let disk_size = disk.size()?;
         let disk_blocks = disk_size / BLOCK_SIZE;
         let block_offset = (reserved.len() as u64).div_ceil(BLOCK_SIZE);
@@ -269,7 +290,7 @@ impl<D: Disk> FileSystem<D> {
             None => None,
         };
 
-        let mut fs = FileSystem {
+        let fs = FileSystem {
             disk,
             block: block_offset,
             header,
@@ -277,6 +298,8 @@ impl<D: Disk> FileSystem<D> {
             cipher_opt,
             compress_cache: compress_cache(),
         };
+        let fs_mux = Arc::new(Mutex::new(fs));
+        let mut fs = fs_mux.lock();
 
         unsafe {
             fs.disk.write_at(fs.block, &fs.header)?;
@@ -297,13 +320,7 @@ impl<D: Disk> FileSystem<D> {
 
             tx.header_mut().tree = tx.write_block(tree)?;
             tx.header_mut().alloc = tx.write_block(alloc)?;
-            tx.set_header_changed(true);
-            Ok(())
-        })?;
 
-        unsafe { fs.reset_allocator()? };
-
-        fs.tx(|tx| unsafe {
             let mut root = BlockData::new(
                 BlockAddr::new(METADATA_START_BLOCK + 2, BlockMeta::default()),
                 Node::new(Node::MODE_DIR | 0o755, 0, 0, ctime, ctime_nsec),
@@ -311,19 +328,36 @@ impl<D: Disk> FileSystem<D> {
             root.data_mut().set_links(1);
             let root_ptr = tx.write_block(root)?;
             assert_eq!(tx.insert_tree(root_ptr)?.id(), 1);
+
+            tx.set_header_changed(true);
             Ok(())
         })?;
 
-        Transaction::new(&mut fs).commit(true)?;
+        unsafe { fs.reset_allocator()? };
 
-        Ok(fs)
+        Ok(fs_mux)
     }
 
     pub fn tx<F: FnOnce(&mut Transaction<D>) -> Result<T>, T>(&mut self, f: F) -> Result<T> {
-        let mut tx = Transaction::new(self);
-        let t = f(&mut tx)?;
-        tx.commit(false)?;
-        Ok(t)
+        let tx = Transaction::new(self);
+        match f(&mut tx) {
+            Ok(res) => {
+                tx.commit(false)?;
+                Ok(res)
+            }
+            Err(err) => {
+                tx.rollback()?;
+                Err(err)
+            }
+        }
+    }
+
+    pub fn try_tx<F: FnOnce(&mut Transaction<D>) -> Result<T>, T>(
+        fs_mux: &Arc<Mutex<Self>>,
+        f: F,
+    ) -> Result<T> {
+        let mut fs = fs_mux.try_lock().ok_or(Error::new(EIO))?;
+        fs.tx(f)
     }
 
     unsafe fn reset_allocator(&mut self) -> Result<()> {
