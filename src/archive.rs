@@ -108,43 +108,15 @@ pub fn archive_at<D: Disk, P: AsRef<Path>>(
 ///
 /// Returns the size of the filesystem in bytes.
 pub fn archive<D: Disk, P: AsRef<Path>>(fs: &mut FileSystem<D>, parent_path: P) -> io::Result<u64> {
-    let end_block = fs
-        .tx(|tx| {
-            // Archive_at root node
-            archive_at(tx, parent_path, TreePtr::root())
-                .map_err(|err| syscall::Error::new(err.raw_os_error().unwrap()))?;
+    let mut tx = Transaction::new(fs);
 
-            // Squash alloc log
-            tx.sync(true)?;
+    archive_at(&mut tx, parent_path, TreePtr::root())?;
 
-            let end_block = tx.header.size() / BLOCK_SIZE;
-            /* TODO: Cut off any free blocks at the end of the filesystem
-            let mut end_changed = true;
-            while end_changed {
-                end_changed = false;
+    let end_block = tx.header().size() / BLOCK_SIZE;
+    tx.header_mut().size = (end_block * BLOCK_SIZE).into();
+    tx.set_header_changed(true);
 
-                let allocator = fs.allocator();
-                let levels = allocator.levels();
-                for level in 0..levels.len() {
-                    let level_size = 1 << level;
-                    for &block in levels[level].iter() {
-                        if block < end_block && block + level_size >= end_block {
-                            end_block = block;
-                            end_changed = true;
-                        }
-                    }
-                }
-            }
-            */
+    tx.commit(true).map_err(syscall_err)?;
 
-            // Update header
-            tx.header.size = (end_block * BLOCK_SIZE).into();
-            tx.header_changed = true;
-            tx.sync(false)?;
-
-            Ok(end_block)
-        })
-        .map_err(syscall_err)?;
-
-    Ok((fs.block + end_block) * BLOCK_SIZE)
+    Ok((fs.block() + end_block) * BLOCK_SIZE)
 }

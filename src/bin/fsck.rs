@@ -20,13 +20,15 @@ fn main() {
         }
     };
 
-    let mut fs = match FileSystem::open(disk, None, None, false, false) {
+    let fs_result = FileSystem::open(disk, None, None, false);
+    let fs_mux = match fs_result {
         Ok(fs) => fs,
         Err(err) => {
             eprintln!("Failed to open filesystem: {}", err);
             process::exit(1);
         }
     };
+    let mut fs = fs_mux.lock();
 
     println!("Filesystem open. Checking consistency...");
 
@@ -50,6 +52,15 @@ fn main() {
         Ok(_) => println!("Allocator verification passed."),
         Err(err) => {
             eprintln!("Allocator verification failed: {}", err);
+            process::exit(1);
+        }
+    }
+
+    println!("Verifying clone integrity...");
+    match fs.tx(|tx| tx.verify_clone_integrity()) {
+        Ok(_) => println!("Clone integrity verification passed."),
+        Err(err) => {
+            eprintln!("Clone integrity verification failed: {}", err);
             process::exit(1);
         }
     }

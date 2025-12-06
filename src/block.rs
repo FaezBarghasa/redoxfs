@@ -1,9 +1,10 @@
 use core::{fmt, marker::PhantomData, mem, ops, slice};
+use core::mem::size_of;
 use endian_num::Le;
 
 use crate::BLOCK_SIZE;
 
-const BLOCK_LIST_ENTRIES: usize = BLOCK_SIZE as usize / mem::size_of::<BlockPtr<BlockRaw>>();
+const BLOCK_LIST_ENTRIES: usize = BLOCK_SIZE as usize / size_of::<BlockPtr<BlockRaw>>();
 
 /// An address of a data block.
 ///
@@ -243,8 +244,8 @@ impl<T> ops::Deref for BlockList<T> {
         unsafe {
             slice::from_raw_parts(
                 self as *const BlockList<T> as *const u8,
-                mem::size_of::<BlockList<T>>(),
-            ) as &[u8]
+                size_of::<BlockList<T>>(),
+            )
         }
     }
 }
@@ -254,8 +255,8 @@ impl<T> ops::DerefMut for BlockList<T> {
         unsafe {
             slice::from_raw_parts_mut(
                 self as *mut BlockList<T> as *mut u8,
-                mem::size_of::<BlockList<T>>(),
-            ) as &mut [u8]
+                size_of::<BlockList<T>>(),
+            )
         }
     }
 }
@@ -389,12 +390,12 @@ impl ops::DerefMut for BlockRaw {
 
 #[test]
 fn block_list_size_test() {
-    assert_eq!(mem::size_of::<BlockList<BlockRaw>>(), BLOCK_SIZE as usize);
+    assert_eq!(size_of::<BlockList<BlockRaw>>(), BLOCK_SIZE as usize);
 }
 
 #[test]
 fn block_raw_size_test() {
-    assert_eq!(mem::size_of::<BlockRaw>(), BLOCK_SIZE as usize);
+    assert_eq!(size_of::<BlockRaw>(), BLOCK_SIZE as usize);
 }
 
 #[test]

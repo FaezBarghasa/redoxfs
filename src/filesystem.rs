@@ -127,7 +127,7 @@ impl<D: Disk> FileSystem<D> {
                 }
             };
 
-            let mut fs = FileSystem {
+            let fs = FileSystem {
                 disk,
                 block,
                 header,
@@ -180,7 +180,8 @@ impl<D: Disk> FileSystem<D> {
             unsafe {
                 disk.read_at(journal_block_idx, &mut buffer)?;
             }
-            let journal_header: &JournalHeader = unsafe { core::mem::transmute(buffer.as_ptr()) };
+            let journal_header: &mut JournalHeader =
+                unsafe { core::mem::transmute(buffer.as_mut_ptr()) };
 
             // Replay the journal entries
             for (i, entry) in journal_header.entries.iter().enumerate() {
@@ -214,10 +215,9 @@ impl<D: Disk> FileSystem<D> {
             }
 
             // Clear the journal entry
-            let mut cleared_header = journal_header.clone();
-            cleared_header.commit_state = 0.into();
+            journal_header.commit_state = 0.into();
             unsafe {
-                disk.write_at(journal_block_idx, &cleared_header)?;
+                disk.write_at(journal_block_idx, &buffer)?;
             }
         }
 
@@ -339,7 +339,7 @@ impl<D: Disk> FileSystem<D> {
     }
 
     pub fn tx<F: FnOnce(&mut Transaction<D>) -> Result<T>, T>(&mut self, f: F) -> Result<T> {
-        let tx = Transaction::new(self);
+        let mut tx = Transaction::new(self);
         match f(&mut tx) {
             Ok(res) => {
                 tx.commit(false)?;
