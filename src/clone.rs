@@ -86,7 +86,7 @@ fn clone_at<D: Disk, E: Disk, F: FnMut(u64)>(
             let mode = node_old.data().mode();
             let (ctime, ctime_nsec) = node_old.data().ctime();
             let (mtime, mtime_nsec) = node_old.data().mtime();
-            let mut node = tx.create_node(parent_ptr, &name, mode, ctime, ctime_nsec)?;
+            let mut node = tx.create_node(parent_ptr, name.to_str().unwrap(), mode, ctime, ctime_nsec)?;
             node.data_mut().set_uid(node_old.data().uid());
             node.data_mut().set_gid(node_old.data().gid());
             node.data_mut().set_mtime(mtime, mtime_nsec);
