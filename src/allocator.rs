@@ -1,4 +1,7 @@
-use alloc::{collections::{BTreeMap, BTreeSet}, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    vec::Vec,
+};
 use core::{fmt, mem, ops, slice};
 use endian_num::Le;
 
@@ -21,6 +24,15 @@ pub struct Allocator {
 impl Allocator {
     pub fn levels(&self) -> &Vec<BTreeSet<u64>> {
         &self.levels
+    }
+
+    pub fn is_allocated(&self, addr: BlockAddr) -> bool {
+        let index = addr.index();
+        let level = addr.level().0;
+        if level >= self.levels.len() {
+            return true;
+        }
+        !self.levels[level].contains(&index)
     }
 
     /// Count the number of free [`BLOCK_SIZE`] available to this [`Allocator`].
@@ -120,7 +132,7 @@ impl Allocator {
                 let index = blocks[i];
                 if index % next_size == 0 {
                     let buddy = index + level_size;
-                    if i + 1 < blocks.len() && blocks[i+1] == buddy {
+                    if i + 1 < blocks.len() && blocks[i + 1] == buddy {
                         removals.push(index);
                         removals.push(buddy);
                         inserts.push(index);
@@ -268,6 +280,22 @@ impl AllocEntry {
 pub struct AllocList {
     pub prev: BlockPtr<AllocList>,
     pub entries: [AllocEntry; ALLOC_LIST_ENTRIES],
+}
+
+impl AllocList {
+    pub fn insert_entry(&mut self, entry: AllocEntry) -> bool {
+        for e in self.entries.iter_mut() {
+            if e.is_null() {
+                *e = entry;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn deallocate(&mut self, addr: BlockAddr) -> bool {
+        self.insert_entry(AllocEntry::deallocate(addr))
+    }
 }
 
 unsafe impl BlockTrait for AllocList {

@@ -27,7 +27,9 @@ impl<D: Disk> Disk for DiskMirror<D> {
     unsafe fn read_at(&mut self, block: u64, buffer: &mut [u8]) -> Result<usize> {
         // Try disk 0, then disk 1
         if self.active_mask & 1 != 0 {
-            if let Ok(sz) = self.disks[0].read_at(block, buffer) { return Ok(sz); }
+            if let Ok(sz) = self.disks[0].read_at(block, buffer) {
+                return Ok(sz);
+            }
         }
         if self.active_mask & 2 != 0 {
             return self.disks[1].read_at(block, buffer);
@@ -75,11 +77,15 @@ impl<D: Disk> Disk for DiskMirror<D> {
         let mut fail_mask = 0;
         // Try write to disk 0
         if self.active_mask & 1 != 0 {
-            if self.disks[0].write_at(block, buffer).is_err() { fail_mask |= 1; }
+            if self.disks[0].write_at(block, buffer).is_err() {
+                fail_mask |= 1;
+            }
         }
         // Try write to disk 1
         if self.active_mask & 2 != 0 {
-            if self.disks[1].write_at(block, buffer).is_err() { fail_mask |= 2; }
+            if self.disks[1].write_at(block, buffer).is_err() {
+                fail_mask |= 2;
+            }
         }
 
         if fail_mask == self.active_mask {
@@ -111,6 +117,22 @@ impl<D: Disk> Disk for DiskMirror<D> {
             let _ = self.disks[1].trim(block, count);
         }
         Ok(())
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        let mut result = Ok(());
+        // Sync both disks if possible
+        if self.active_mask & 1 != 0 {
+            if let Err(err) = self.disks[0].sync() {
+                result = Err(err);
+            }
+        }
+        if self.active_mask & 2 != 0 {
+            if let Err(err) = self.disks[1].sync() {
+                result = Err(err);
+            }
+        }
+        result
     }
 }
 

@@ -1,5 +1,5 @@
-use core::{fmt, marker::PhantomData, mem, ops, slice};
 use core::mem::size_of;
+use core::{fmt, marker::PhantomData, mem, ops, slice};
 use endian_num::Le;
 
 use crate::BLOCK_SIZE;
@@ -118,6 +118,7 @@ impl BlockMeta {
 pub struct BlockLevel(pub(crate) usize);
 
 impl BlockLevel {
+    pub const L0: BlockLevel = BlockLevel(0);
     /// Returns the smallest block level that can contain
     /// the given number of bytes.
     pub(crate) fn for_bytes(bytes: u64) -> Self {

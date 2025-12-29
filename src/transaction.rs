@@ -13,15 +13,12 @@ use syscall::error::{
 };
 
 use crate::{
-    disk::BlockTypeHint,
-    htree::{self, HTreeHash, HTreeNode, HTreePtr},
-    journal::JournalEntry,
-    node::AclList,
-    AllocEntry, AllocList, Allocator, BlockAddr, BlockData, BlockLevel, BlockList, BlockMeta,
-    BlockPtr, BlockRaw, BlockTrait, DirEntry, DirList, Disk, FileSystem, Header, Node, NodeFlags,
-    NodeLevel, NodeLevelData, QuotaEntry, QuotaList, QuotaRoot, RecordRaw, Tree, TreeData, TreePtr,
-    ALLOC_GC_THRESHOLD, ALLOC_LIST_ENTRIES, BLOCK_SIZE, DIR_ENTRY_MAX_LENGTH, HEADER_RING,
+    disk::BlockTypeHint, journal::JournalEntry, AllocEntry, AllocList, Allocator, BlockAddr,
+    BlockData, BlockLevel, BlockList, BlockMeta, BlockPtr, BlockRaw, BlockTrait, DirEntry, DirList,
+    Disk, FileSystem, Header, Node, NodeLevelData, TreeData, TreeList, TreePtr, ALLOC_GC_THRESHOLD,
+    BLOCK_SIZE, DIR_ENTRY_MAX_LENGTH, HEADER_RING, RECORD_LEVEL,
 };
+use std::cmp;
 
 pub(crate) fn level_data(node: &TreeData<Node>) -> Result<&NodeLevelData> {
     node.data().level_data().ok_or_else(|| {
@@ -82,7 +79,7 @@ pub struct Transaction<'a, D: Disk> {
     allocator: Allocator,
     allocator_log: VecDeque<AllocEntry>,
     deallocate: Vec<BlockAddr>,
-    write_cache: BTreeMap<BlockAddr, Box<[u8]>>,
+    pub(crate) write_cache: BTreeMap<BlockAddr, Box<[u8]>>,
     shadow_cache: BTreeMap<BlockAddr, Box<[u8]>>,
 }
 
@@ -129,9 +126,12 @@ impl<'a, D: Disk> Transaction<'a, D> {
 
     pub fn rollback(self) -> Result<()> {
         // Discard write_cache, restore shadow_cache
+        let block_offset = self.fs.block();
         for (addr, data) in self.shadow_cache.iter() {
             unsafe {
-                self.fs.disk().write_at(self.fs.block() + addr.index(), &data)?;
+                self.fs
+                    .disk()
+                    .write_at(block_offset + addr.index(), &data)?;
             }
         }
         Ok(())
@@ -156,7 +156,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
             .allocator
             .allocate(old_addr.meta())
             .ok_or(Error::new(ENOSPC))?;
-        block.data_mut().set_addr(new_addr);
+        block.swap_addr(new_addr);
 
         // Deallocate the old block
         self.deallocate(&mut FsCtx, old_addr);
@@ -262,16 +262,14 @@ impl<'a, D: Disk> Transaction<'a, D> {
             let entry = JournalEntry {
                 block_index: (*addr).index().into(),
                 generation: next_gen.into(),
-                hash: raw.create_ptr().hash().into(),
+                hash: seahash::hash(raw).into(),
             };
             journal_header.entries[i] = entry;
-            unsafe {
-                self.fs
-                    .disk()
-                    .write_at(journal_data_block, raw.as_ref())?
-            };
+            unsafe { self.fs.disk().write_at(journal_data_block, raw.as_ref())? };
             journal_data_block += 1;
         }
+
+        self.fs.disk().sync()?;
 
         // Write Journal Header (Phase 1: Writing)
         unsafe {
@@ -282,16 +280,19 @@ impl<'a, D: Disk> Transaction<'a, D> {
             self.fs.disk().write_at(journal_block, header_bytes)?;
         }
 
+        self.fs.disk().sync()?;
+
         // Journal Commit (Phase 2: Committed)
         journal_header.commit_state = 1.into();
         unsafe {
-            let commit_state_bytes = journal_header.commit_state.to_ne().to_le_bytes();
-            let offset =
-                &journal_header.commit_state as *const _ as usize - &journal_header as *const _ as usize;
-            self.fs
-                .disk()
-                .write_at_part(journal_block, &commit_state_bytes, offset, commit_state_bytes.len())?
+            let header_bytes = core::slice::from_raw_parts(
+                &journal_header as *const _ as *const u8,
+                crate::BLOCK_SIZE as usize,
+            );
+            self.fs.disk().write_at(journal_block, header_bytes)?;
         }
+
+        self.fs.disk().sync()?;
 
         // Checkpoint: Write data to their final locations
         for (i, (addr, raw)) in self.write_cache.iter().enumerate() {
@@ -299,20 +300,26 @@ impl<'a, D: Disk> Transaction<'a, D> {
                 break;
             }
             unsafe {
+                let block_offset = self.fs.block();
                 self.fs
                     .disk()
-                    .write_at(self.fs.block() + addr.index(), raw.as_ref())?
+                    .write_at(block_offset + addr.index(), raw.as_ref())?
             };
         }
+
+        self.fs.disk().sync()?;
 
         // Update and write the main header
         let gen = self.header.update(self.fs.cipher_opt());
         let gen_block = gen % crate::HEADER_RING;
         unsafe {
+            let block_offset = self.fs.block();
             self.fs
                 .disk()
-                .write_at(self.fs.block() + gen_block, &self.header)?;
+                .write_at(block_offset + gen_block, &self.header)?;
         }
+
+        self.fs.disk().sync()?;
 
         // Update FS state
         unsafe {
@@ -323,7 +330,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
         Ok(())
     }
 
-    fn sync_allocator(&mut self, force_squash: bool) -> Result<bool> {
+    pub(crate) fn sync_allocator(&mut self, force_squash: bool) -> Result<bool> {
         let mut changed = false;
         let mut alloc_ptr = self.header.alloc;
         let mut allocs = VecDeque::new();
@@ -334,19 +341,16 @@ impl<'a, D: Disk> Transaction<'a, D> {
             allocs.push_front(alloc);
         }
 
-        let gc_threshold = if force_squash {
-            0
-        } else {
-            ALLOC_GC_THRESHOLD
-        };
+        let gc_threshold = if force_squash { 0 } else { ALLOC_GC_THRESHOLD };
 
-        if self.deallocate.len() > gc_threshold {
+        if self.deallocate.len() > gc_threshold as usize {
             changed = true;
 
             let mut deallocated = 0;
             'deallocate: while let Some(addr) = self.deallocate.pop() {
                 for alloc in allocs.iter_mut() {
-                    if alloc.data_mut().deallocate(addr) {
+                    let alloc_data: &mut AllocList = alloc.data_mut();
+                    if alloc_data.deallocate(addr) {
                         deallocated += 1;
                         continue 'deallocate;
                     }
@@ -436,7 +440,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
 
     pub fn sync_tree<T: BlockTrait + DerefMut<Target = [u8]> + Deref<Target = [u8]>>(
         &mut self,
-        mut node: TreeData<T>,
+        node: TreeData<T>,
     ) -> Result<()> {
         let (i3, i2, i1, i0) = node.ptr().indexes();
 
@@ -446,22 +450,22 @@ impl<'a, D: Disk> Transaction<'a, D> {
             let mut l1 = self.read_block(l2.data().ptrs[i2])?;
             let mut l0 = self.read_block(l1.data().ptrs[i1])?;
 
-            let raw_ptr = self.write_block(BlockData::new(
-                l0.data().ptrs[i0].addr(),
-                node.data_mut(),
-            ))?;
-            l0.data_mut().ptrs[i0] = raw_ptr.cast();
+            let mut block_data = self.read_block(unsafe { l0.data().ptrs[i0].cast::<T>() })?;
+            *block_data.data_mut() = node.into_data();
+            let raw_ptr = unsafe { self.write_block(block_data)? };
 
-            let l0_ptr = self.write_block(l0)?;
+            l0.data_mut().ptrs[i0] = unsafe { raw_ptr.cast() };
+
+            let l0_ptr = unsafe { self.write_block(l0)? };
             l1.data_mut().ptrs[i1] = l0_ptr;
 
-            let l1_ptr = self.write_block(l1)?;
+            let l1_ptr = unsafe { self.write_block(l1)? };
             l2.data_mut().ptrs[i2] = l1_ptr;
 
-            let l2_ptr = self.write_block(l2)?;
+            let l2_ptr = unsafe { self.write_block(l2)? };
             l3.data_mut().ptrs[i3] = l2_ptr;
 
-            self.header_mut().tree = self.write_block(l3)?;
+            self.header_mut().tree = unsafe { self.write_block(l3)? };
         }
 
         self.set_header_changed(true);
@@ -483,18 +487,18 @@ impl<'a, D: Disk> Transaction<'a, D> {
             let mut l1 = self.shadow_block(l2.data().ptrs[i2])?;
             let mut l0 = self.shadow_block(l1.data().ptrs[i1])?;
 
-            l0.data_mut().ptrs[i0] = node;
+            l0.data_mut().ptrs[i0] = unsafe { node.cast() };
 
-            let l0_ptr = self.write_block(l0)?;
+            let l0_ptr = unsafe { self.write_block(l0)? };
             l1.data_mut().ptrs[i1] = l0_ptr;
 
-            let l1_ptr = self.write_block(l1)?;
+            let l1_ptr = unsafe { self.write_block(l1)? };
             l2.data_mut().ptrs[i2] = l1_ptr;
 
-            let l2_ptr = self.write_block(l2)?;
+            let l2_ptr = unsafe { self.write_block(l2)? };
             l3.data_mut().ptrs[i3] = l2_ptr;
 
-            self.header_mut().tree = self.write_block(l3)?;
+            self.header_mut().tree = unsafe { self.write_block(l3)? };
         }
 
         // The logic for updating unalloc_ptr is also outdated.
@@ -521,7 +525,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
             self.deallocate(&mut FsCtx, node_ptr.addr());
             l0.data_mut().ptrs[i0] = BlockPtr::default();
 
-            let l0_ptr = self.write_block(l0)?;
+            let l0_ptr = unsafe { self.write_block(l0)? };
             l1.data_mut().ptrs[i1] = l0_ptr;
 
             let l1_ptr = self.write_block(l1)?;
@@ -558,7 +562,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
         }
 
         // 3. Read or create the parent's `DirList`.
-        let mut parent_dir_list_ptr = level_data(&parent_node)?.level0[0].cast();
+        let mut parent_dir_list_ptr = unsafe { level_data(&parent_node)?.level0[0].cast() };
         let mut parent_dir_list = if parent_dir_list_ptr.is_null() {
             BlockData::new(
                 self.allocator
@@ -600,17 +604,21 @@ impl<'a, D: Disk> Transaction<'a, D> {
         // 9. Update and sync the parent's `DirList` and node.
         parent_node.data_mut().set_mtime(ctime, ctime_nsec);
         parent_node.data_mut().set_atime(ctime, ctime_nsec);
-        parent_node.data_mut().set_size(parent_dir_list.data().deref().len() as u64); // Update size based on DirList content
-        parent_node.data_mut().set_blocks(parent_node.data().blocks() + 1); // Account for the new node block
+        parent_node
+            .data_mut()
+            .set_size(parent_dir_list.data().deref().len() as u64); // Update size based on DirList content
+        let parent_blocks = parent_node.data().blocks();
+        parent_node.data_mut().set_blocks(parent_blocks + 1); // Account for the new node block
 
         // Update parent's level0[0] to point to the new DirList
         parent_dir_list_ptr = unsafe { self.write_block(parent_dir_list)? }.cast();
-        level_data_mut(&mut parent_node)?.level0[0] = parent_dir_list_ptr;
+        level_data_mut(&mut parent_node)?.level0[0] = unsafe { parent_dir_list_ptr.cast() };
 
         self.sync_tree(parent_node)?;
 
         // Increment link count for the new node
-        new_node_tree_data.data_mut().set_links(new_node_tree_data.data().links() + 1);
+        let links = new_node_tree_data.data().links();
+        new_node_tree_data.data_mut().set_links(links + 1);
         self.sync_tree(new_node_tree_data.clone())?;
 
         Ok(new_node_tree_data)
@@ -643,10 +651,12 @@ impl<'a, D: Disk> Transaction<'a, D> {
                 let inline_len = inline_data_slice.len() as u64;
                 if current_offset < inline_len {
                     let write_start = current_offset as usize;
-                    let write_end = min(inline_len, current_offset + remaining_buf.len() as u64) as usize;
+                    let write_end =
+                        min(inline_len, current_offset + remaining_buf.len() as u64) as usize;
                     let len_to_write = write_end - write_start;
 
-                    inline_data_slice[write_start..write_end].copy_from_slice(&remaining_buf[..len_to_write]);
+                    inline_data_slice[write_start..write_end]
+                        .copy_from_slice(&remaining_buf[..len_to_write]);
                     bytes_written += len_to_write;
                     current_offset += len_to_write as u64;
                     remaining_buf = &remaining_buf[len_to_write..];
@@ -661,7 +671,8 @@ impl<'a, D: Disk> Transaction<'a, D> {
 
             // For simplicity, only support L0 blocks for now.
             // If the write goes beyond L0, return ERANGE.
-            if start_block_idx >= 56 { // 56 is the number of L0 blocks in NodeLevelData
+            if start_block_idx >= 56 {
+                // 56 is the number of L0 blocks in NodeLevelData
                 return Err(Error::new(ERANGE));
             }
 
@@ -671,10 +682,8 @@ impl<'a, D: Disk> Transaction<'a, D> {
                 let block_offset_in_node = block_idx * block_size;
                 let offset_in_block = (current_offset - block_offset_in_node) as usize;
 
-                let len_to_write_in_block = min(
-                    remaining_buf.len(),
-                    block_size as usize - offset_in_block,
-                );
+                let len_to_write_in_block =
+                    min(remaining_buf.len(), block_size as usize - offset_in_block);
 
                 let current_block_ptr = level_data_mut_ref.level0[block_idx as usize];
                 let mut current_block_data = if current_block_ptr.is_null() {
@@ -684,14 +693,15 @@ impl<'a, D: Disk> Transaction<'a, D> {
                         .ok_or(Error::new(ENOSPC))?;
                     BlockData::new(new_block_addr, BlockRaw::empty(BlockLevel::L0).unwrap())
                 } else {
-                    self.read_block(current_block_ptr.cast())?
+                    self.read_block(unsafe { current_block_ptr.cast() })?
                 };
 
-                current_block_data.data_mut()[offset_in_block..offset_in_block + len_to_write_in_block]
+                current_block_data.data_mut()
+                    [offset_in_block..offset_in_block + len_to_write_in_block]
                     .copy_from_slice(&remaining_buf[..len_to_write_in_block]);
 
                 let new_block_ptr = unsafe { self.write_block(current_block_data)? };
-                level_data_mut_ref.level0[block_idx as usize] = new_block_ptr.cast();
+                level_data_mut_ref.level0[block_idx as usize] = unsafe { new_block_ptr.cast() };
 
                 bytes_written += len_to_write_in_block;
                 current_offset += len_to_write_in_block as u64;
@@ -717,11 +727,14 @@ impl<'a, D: Disk> Transaction<'a, D> {
         // 1. Traverse all trees (inodes, etc.) and collect allocated blocks
         self.traverse_and_collect_blocks(&mut allocated_blocks)?;
 
-        // 2. Verify and repair the allocator based on the collected blocks
-        self.verify_allocator_against_map(&allocated_blocks)?;
+        // 1. Traverse all trees (inodes, etc.) and collect allocated blocks
+        self.traverse_and_collect_blocks(&mut allocated_blocks)?;
 
-        // 3. Check for orphaned nodes (not reachable from the root)
+        // 2. Check for orphaned nodes (not reachable from the root) and reclaim them
         self.find_and_reclaim_orphaned_nodes(&allocated_blocks)?;
+
+        // 3. Verify the allocator matches the reachable graph
+        self.verify_allocator_against_map(&allocated_blocks)?;
 
         Ok(())
     }
@@ -731,29 +744,116 @@ impl<'a, D: Disk> Transaction<'a, D> {
         allocated_blocks: &mut BTreeMap<u64, bool>,
     ) -> Result<()> {
         let mut queue = VecDeque::new();
-        queue.push_back(self.header.tree);
+        // H-Tree root is height 4 (L3..L0). L3 is root.
+        queue.push_back((unsafe { self.header.tree.cast::<TreeList<BlockRaw>>() }, 4));
 
-        while let Some(ptr) = queue.pop_front() {
-            if ptr.is_null() || allocated_blocks.contains_key(&ptr.addr().index()) {
+        // Mark allocator blocks as used
+        let mut alloc_ptr = self.header.alloc;
+        while !alloc_ptr.is_null() {
+            let index = alloc_ptr.addr().index();
+            if allocated_blocks.contains_key(&index) {
+                break;
+            }
+            allocated_blocks.insert(index, true);
+            let alloc_block = self.read_block(alloc_ptr)?;
+            alloc_ptr = alloc_block.data().prev;
+        }
+
+        while let Some((ptr, height)) = queue.pop_front() {
+            if ptr.is_null() {
                 continue;
             }
-            allocated_blocks.insert(ptr.addr().index(), true);
+            let index = ptr.addr().index();
+            if allocated_blocks.contains_key(&index) {
+                continue;
+            }
 
-            let block = self.read_block(ptr)?;
-            // TODO: Reimplement block.as_tree() and block.as_node() logic
-            // if let Ok(tree) = block.as_tree() {
-            //     for child_ptr in tree.ptrs.iter() {
-            //         queue.push_back(*child_ptr);
-            //     }
-            // } else if let Ok(node) = self.read_tree(TreePtr::from_indexes((0, 0, 0, 0))) {
-            //     // This is a simplified traversal. A real implementation would need to handle
-            //     // different node types and their specific data structures.
-            //     if let Some(level_data) = node.data().level_data() {
-            //         for ptr in level_data.ptrs.iter() {
-            //             queue.push_back(*ptr);
-            //         }
-            //     }
-            // }
+            allocated_blocks.insert(index, true);
+
+            // If height == 0, this is a Node block (Leaf of H-Tree)
+            if height == 0 {
+                let node = {
+                    let node_block = unsafe { self.read_block(ptr.cast::<Node>())? };
+                    node_block.data().clone()
+                };
+                self.traverse_node_data(&node, allocated_blocks)?;
+                continue;
+            }
+
+            // Else, it is a TreeList (Intermediate H-Tree node)
+            let list_block = self.read_block(ptr)?;
+            let list = list_block.data();
+
+            for child_ptr in list.ptrs.iter() {
+                if !child_ptr.is_null() {
+                    queue.push_back((unsafe { child_ptr.cast() }, height - 1));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn traverse_node_data(
+        &mut self,
+        node: &Node,
+        allocated_blocks: &mut BTreeMap<u64, bool>,
+    ) -> Result<()> {
+        if let Some(level_data) = node.level_data() {
+            for ptr in level_data.level0.iter() {
+                self.traverse_data_ptr(unsafe { ptr.cast() }, 0, allocated_blocks)?;
+            }
+            for ptr in level_data.level1.iter() {
+                self.traverse_data_ptr(unsafe { ptr.cast() }, 1, allocated_blocks)?;
+            }
+            for ptr in level_data.level2.iter() {
+                self.traverse_data_ptr(unsafe { ptr.cast() }, 2, allocated_blocks)?;
+            }
+            for ptr in level_data.level3.iter() {
+                self.traverse_data_ptr(unsafe { ptr.cast() }, 3, allocated_blocks)?;
+            }
+            for ptr in level_data.level4.iter() {
+                self.traverse_data_ptr(unsafe { ptr.cast() }, 4, allocated_blocks)?;
+            }
+        }
+        if !node.acl_ptr.is_null() {
+            allocated_blocks.insert(node.acl_ptr.addr().index(), true);
+        }
+        Ok(())
+    }
+
+    fn traverse_data_ptr(
+        &mut self,
+        ptr: BlockPtr<BlockRaw>,
+        height: usize,
+        allocated_blocks: &mut BTreeMap<u64, bool>,
+    ) -> Result<()> {
+        if ptr.is_null() {
+            return Ok(());
+        }
+        let index = ptr.addr().index();
+        if allocated_blocks.contains_key(&index) {
+            return Ok(());
+        }
+
+        allocated_blocks.insert(index, true);
+
+        if height == 0 {
+            return Ok(());
+        }
+
+        let list_ptr = unsafe { ptr.cast::<BlockList<BlockRaw>>() };
+        let list_block = self.read_block(list_ptr)?;
+        let list = list_block.data(); // Borrow self via list_block
+
+        // Copy pointers to avoid holding borrow during recursion!
+        // BlockList has limited entries (128). We can copy.
+        // Actually, recursive call borrows self mutably.
+        // So we cannot hold reference to list.data().
+        let ptrs: Vec<BlockPtr<BlockRaw>> = list.ptrs.iter().map(|p| unsafe { p.cast() }).collect();
+        drop(list_block); // Drop borrow
+
+        for child in ptrs {
+            self.traverse_data_ptr(child, height - 1, allocated_blocks)?;
         }
         Ok(())
     }
@@ -767,10 +867,9 @@ impl<'a, D: Disk> Transaction<'a, D> {
 
         for i in 0..total_blocks {
             let is_allocated_in_map = allocated_blocks.contains_key(&i);
-            let is_allocated_in_allocator = self.allocator.is_allocated(BlockAddr::new(
-                i,
-                BlockMeta::new(BlockLevel::L0),
-            ));
+            let is_allocated_in_allocator = self
+                .allocator
+                .is_allocated(unsafe { BlockAddr::new(i, BlockMeta::new(BlockLevel::L0)) });
 
             if is_allocated_in_map != is_allocated_in_allocator {
                 inconsistencies += 1;
@@ -790,9 +889,57 @@ impl<'a, D: Disk> Transaction<'a, D> {
         &mut self,
         allocated_blocks: &BTreeMap<u64, bool>,
     ) -> Result<()> {
-        // This is a complex task that requires a full graph traversal of the filesystem.
-        // The basic idea is to start from the root and mark all reachable nodes. Any nodes
-        // that are allocated but not marked are orphans and can be reclaimed.
+        let total_blocks = self.header.size() / BLOCK_SIZE;
+        let mut reclaimed_count = 0;
+
+        for i in 0..total_blocks {
+            let is_allocated = self
+                .allocator
+                .is_allocated(unsafe { BlockAddr::new(i, BlockMeta::new(BlockLevel::L0)) });
+
+            if is_allocated && !allocated_blocks.contains_key(&i) {
+                // Orphan detected!
+                #[cfg(feature = "log")]
+                log::info!("Reclaiming orphaned block: {}", i);
+
+                // We use self.deallocate helper logic (which adds to deallocate list or updates log)
+                // But Transaction::deallocate implementation assumes standard flow.
+                // We want to force deallocate from Allocator.
+                // However, Transaction::deallocate is high level.
+                // Let's manually push to deallocate list or use Allocator directly?
+                // Using Transaction::deallocate is safer as it respects transaction log logic.
+                // But it takes &mut dyn AllocCtx. We can use FsCtx.
+
+                // Note: BlockMeta is needed. L0 is safe assumption for orphans if they are allocated as L0?
+                // If they were L1+, the Allocator tracks them as used blocks?
+                // RedoxFS allocator tracks blocks by level.
+                // If I deallocate L0, but it was L1, it might corrupt buddy allocator?
+                // Is there a way to know the level of an allocated block?
+                // AllocList doesn't store level. Allocator in RAM attempts to track free blocks by level.
+                // But used blocks are "Implicitly 1 refcount". We don't know their level.
+                // However, allocate() allocates exact or splits.
+                // When deallocating, we usually know the level from the Pointer (BlockPtr).
+                // For orphans, we lost the pointer!
+                // So we don't know the level.
+                // Safest is to assume L0. If it was larger, we leak the "buddy" merging potential but reclaim the space as L0s.
+                // Wait, if 2 L0s make 1 L1. If I free 2 L0s, they can merge.
+                // So freeing as L0 is strictly correct for reclamation.
+
+                unsafe {
+                    self.deallocate(
+                        &mut FsCtx,
+                        BlockAddr::new(i, BlockMeta::new(BlockLevel::L0)),
+                    );
+                }
+                reclaimed_count += 1;
+            }
+        }
+
+        if reclaimed_count > 0 {
+            #[cfg(feature = "log")]
+            log::info!("Reclaimed {} orphaned blocks", reclaimed_count);
+        }
+
         Ok(())
     }
 
@@ -807,6 +954,262 @@ impl<'a, D: Disk> Transaction<'a, D> {
         // ensuring that all reference counts are correct and that no blocks are shared incorrectly.
         // This would involve building a map of all blocks and their refcounts and then
         // comparing it against the allocator's refcounts.
+        Ok(())
+    }
+
+    pub fn read_node(
+        &mut self,
+        ptr: TreePtr<Node>,
+        offset: u64,
+        buf: &mut [u8],
+        atime_sec: u64,
+        atime_nsec: u32,
+    ) -> Result<usize> {
+        let mut node = self.read_tree(ptr)?;
+
+        // Update atime
+        node.data_mut().set_atime(atime_sec, atime_nsec);
+        self.sync_tree(node.clone())?;
+
+        let file_size = node.data().size();
+        let mut i = 0;
+        while i < buf.len() && offset + (i as u64) < file_size {
+            let pos = offset + i as u64;
+            let block_index = pos / BLOCK_SIZE;
+            let block_offset = (pos % BLOCK_SIZE) as usize;
+            let remaining_in_block = BLOCK_SIZE as usize - block_offset;
+            let to_read = cmp::min(buf.len() - i, remaining_in_block);
+
+            if let Some(level_data) = node.data().level_data() {
+                if block_index < 56 {
+                    let ptr = level_data.level0[block_index as usize];
+                    if ptr.is_null() {
+                        for b in &mut buf[i..i + to_read] {
+                            *b = 0;
+                        }
+                    } else {
+                        let block = self.read_block(unsafe { ptr.cast::<BlockRaw>() })?;
+                        buf[i..i + to_read]
+                            .copy_from_slice(&block.data()[block_offset..block_offset + to_read]);
+                    }
+                } else {
+                    return Err(Error::new(EIO));
+                }
+            } else if let Some(inline) = node.data().inline_data() {
+                if pos >= inline.len() as u64 {
+                    break;
+                }
+                let inline_end = cmp::min(pos + to_read as u64, inline.len() as u64);
+                let len = (inline_end - pos) as usize;
+                buf[i..i + len].copy_from_slice(&inline[pos as usize..(pos as usize) + len]);
+            }
+
+            i += to_read;
+        }
+
+        Ok(i)
+    }
+
+    pub fn find_node(&mut self, parent_ptr: TreePtr<Node>, name: &str) -> Result<TreeData<Node>> {
+        let parent = self.read_tree(parent_ptr)?;
+        if !parent.data().is_dir() {
+            return Err(Error::new(ENOTDIR));
+        }
+
+        if let Some(level_data) = parent.data().level_data() {
+            for ptr in level_data.level0.iter() {
+                if !ptr.is_null() {
+                    let dir_list_block = self.read_block(unsafe { ptr.cast::<DirList>() })?;
+                    if let Some(entry) = dir_list_block.data().find_entry(name) {
+                        return self.read_tree(entry.node_ptr());
+                    }
+                }
+            }
+        }
+        Err(Error::new(ENOENT))
+    }
+
+    pub fn child_nodes(
+        &mut self,
+        parent_ptr: TreePtr<Node>,
+        children: &mut Vec<DirEntry>,
+    ) -> Result<()> {
+        let parent = self.read_tree(parent_ptr)?;
+        if !parent.data().is_dir() {
+            return Err(Error::new(ENOTDIR));
+        }
+
+        if let Some(level_data) = parent.data().level_data() {
+            for ptr in level_data.level0.iter() {
+                if !ptr.is_null() {
+                    let dir_list_block = self.read_block(unsafe { ptr.cast::<DirList>() })?;
+                    for entry in dir_list_block.data().entries() {
+                        children.push(entry);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn remove_node(&mut self, parent_ptr: TreePtr<Node>, name: &str, _mode: u16) -> Result<()> {
+        let mut parent = self.read_tree(parent_ptr)?;
+        if !parent.data().is_dir() {
+            return Err(Error::new(ENOTDIR));
+        }
+
+        let mut found = false;
+        let mut entry_to_remove = None;
+
+        if let Some(level_data) = parent.data_mut().level_data_mut() {
+            for ptr in level_data.level0.iter_mut() {
+                if !ptr.is_null() {
+                    let mut dir_list_block = self.read_block(unsafe { ptr.cast::<DirList>() })?;
+                    if let Some(entry) = dir_list_block.data().find_entry(name) {
+                        entry_to_remove = Some(entry);
+                        if dir_list_block.data_mut().remove_entry(name) {
+                            let new_ptr = unsafe { self.write_block(dir_list_block)? };
+                            *ptr = unsafe { new_ptr.cast() };
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !found {
+            return Err(Error::new(ENOENT));
+        }
+        self.sync_tree(parent)?;
+
+        if let Some(entry) = entry_to_remove {
+            let mut node = self.read_tree(entry.node_ptr())?;
+            let links = node.data().links();
+            if links > 0 {
+                node.data_mut().set_links(links - 1);
+                let new_links = links - 1;
+                self.sync_tree(node)?;
+                if new_links == 0 {
+                    self.remove_tree(entry.node_ptr())?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn rename_node(
+        &mut self,
+        orig_parent: TreePtr<Node>,
+        orig_name: &str,
+        new_parent: TreePtr<Node>,
+        new_name: &str,
+    ) -> Result<()> {
+        let node_data = self.find_node(orig_parent, orig_name)?;
+        let node_ptr = node_data.ptr();
+
+        if let Ok(_) = self.find_node(new_parent, new_name) {
+            return Err(Error::new(EEXIST));
+        }
+
+        let mut new_parent_node = self.read_tree(new_parent)?;
+        let mut added = false;
+        if let Some(level_data) = new_parent_node.data_mut().level_data_mut() {
+            for ptr in level_data.level0.iter_mut() {
+                if !ptr.is_null() {
+                    let mut dir_list_block = self.read_block(unsafe { ptr.cast::<DirList>() })?;
+                    let entry = DirEntry::new(node_ptr, new_name);
+                    if dir_list_block.data_mut().append(&entry) {
+                        let new_block_ptr = unsafe { self.write_block(dir_list_block)? };
+                        *ptr = unsafe { new_block_ptr.cast() };
+                        added = true;
+                        break;
+                    }
+                } else {
+                    let addr = self
+                        .allocator
+                        .allocate(BlockMeta::new(BlockLevel::L0))
+                        .ok_or(Error::new(ENOSPC))?;
+                    let mut dir_list = DirList::empty(BlockLevel::L0).unwrap();
+                    let entry = DirEntry::new(node_ptr, new_name);
+                    dir_list.append(&entry);
+
+                    let block_data = BlockData::new(addr, dir_list);
+                    let new_block_ptr = unsafe { self.write_block(block_data)? };
+                    *ptr = unsafe { new_block_ptr.cast() };
+                    added = true;
+                    break;
+                }
+            }
+        }
+        if !added {
+            return Err(Error::new(ENOSPC));
+        }
+        self.sync_tree(new_parent_node)?;
+        self.remove_node_entry_only(orig_parent, orig_name)?;
+
+        Ok(())
+    }
+
+    fn remove_node_entry_only(&mut self, parent_ptr: TreePtr<Node>, name: &str) -> Result<()> {
+        let mut parent = self.read_tree(parent_ptr)?;
+        if let Some(level_data) = parent.data_mut().level_data_mut() {
+            for ptr in level_data.level0.iter_mut() {
+                if !ptr.is_null() {
+                    let mut dir_list_block = self.read_block(unsafe { ptr.cast::<DirList>() })?;
+                    if dir_list_block.data_mut().remove_entry(name) {
+                        let new_ptr = unsafe { self.write_block(dir_list_block)? };
+                        *ptr = unsafe { new_ptr.cast() };
+                        self.sync_tree(parent)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(Error::new(ENOENT))
+    }
+
+    pub fn truncate_node_inner(&mut self, node: &mut TreeData<Node>, size: u64) -> Result<bool> {
+        let old_size = node.data().size();
+        if size == old_size {
+            return Ok(false);
+        }
+
+        node.data_mut().set_size(size);
+        if size < old_size {
+            let blocks_needed = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            if let Some(level_data) = node.data_mut().level_data_mut() {
+                for i in blocks_needed..56 {
+                    let ptr = &mut level_data.level0[i as usize];
+                    if !ptr.is_null() {
+                        unsafe {
+                            self.deallocate(&mut FsCtx, ptr.addr());
+                        }
+                        *ptr = BlockPtr::default();
+                    }
+                }
+            }
+        }
+        self.sync_tree(node.clone())?;
+        Ok(true)
+    }
+
+    pub fn set_acl(&mut self, node_ptr: TreePtr<Node>, acl: &crate::node::AclList) -> Result<()> {
+        let mut node = self.read_tree(node_ptr)?;
+        let addr = self
+            .allocator
+            .allocate(BlockMeta::new(BlockLevel::L0))
+            .ok_or(Error::new(ENOSPC))?;
+        let block_data = BlockData::new(addr, acl.clone());
+        let block_ptr = unsafe { self.write_block(block_data)? };
+
+        node.data_mut().acl_ptr = unsafe { block_ptr.cast() };
+        self.sync_tree(node)?;
+        Ok(())
+    }
+
+    pub fn sync_block(&mut self, _addr: BlockAddr) -> Result<()> {
         Ok(())
     }
 }

@@ -42,7 +42,10 @@ impl DiskFile {
 
         // Simple heuristic: assume Unknown unless we add platform-specific detection
         // In a real OS driver (like on Redox OS), the Scheme would know the device type.
-        Ok(DiskFile { file, media_type: MediaType::Unknown })
+        Ok(DiskFile {
+            file,
+            media_type: MediaType::Unknown,
+        })
     }
 
     /// Create a disk file
@@ -54,7 +57,10 @@ impl DiskFile {
             .open(path)
             .or_eio()?;
         file.set_len(size).or_eio()?;
-        Ok(DiskFile { file, media_type: MediaType::Unknown })
+        Ok(DiskFile {
+            file,
+            media_type: MediaType::Unknown,
+        })
     }
 
     /// Set the media type
@@ -85,11 +91,19 @@ impl Disk for DiskFile {
     }
 
     // We could implement TRIM here using BLKDISCARD ioctl on Linux if self.file is a block device
+
+    /// Sync the disk.
+    fn sync(&mut self) -> Result<()> {
+        self.file.sync_all().or_eio()
+    }
 }
 
 impl From<File> for DiskFile {
     /// Create a `DiskFile` from a `File`.
     fn from(file: File) -> Self {
-        Self { file, media_type: MediaType::Unknown }
+        Self {
+            file,
+            media_type: MediaType::Unknown,
+        }
     }
 }

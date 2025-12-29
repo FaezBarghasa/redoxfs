@@ -50,4 +50,9 @@ impl Disk for DiskSparse {
     fn size(&mut self) -> Result<u64> {
         Ok(self.max_size)
     }
+
+    fn sync(&mut self) -> Result<()> {
+        try_disk!(self.file.sync_all());
+        Ok(())
+    }
 }

@@ -78,15 +78,20 @@ fn clone_at<D: Disk, E: Disk, F: FnMut(u64)>(
         let node_ptr_old = entry.node_ptr();
         let node_old = tx_old.read_tree(node_ptr_old)?;
 
-        if tx.write_cache().len() > 64 {
-            tx.sync(false)?;
+        if tx.write_cache.len() > 1024 {
+            // Commit and sync to keep transaction size manageable
+            // However, since we are in a recursive function with &mut Transaction,
+            // we can't easily restart the transaction here without changing the API.
+            // For now, let's just sync the allocator to free some memory if possible.
+            tx.sync_allocator(false)?;
         }
 
         let node_ptr = {
+            let (atime, atime_nsec) = node_old.data().atime();
             let mode = node_old.data().mode();
             let (ctime, ctime_nsec) = node_old.data().ctime();
             let (mtime, mtime_nsec) = node_old.data().mtime();
-            let mut node = tx.create_node(parent_ptr, name.to_str().unwrap(), mode, ctime, ctime_nsec)?;
+            let mut node = tx.create_node(parent_ptr, name, mode, ctime, ctime_nsec)?;
             node.data_mut().set_uid(node_old.data().uid());
             node.data_mut().set_gid(node_old.data().gid());
             node.data_mut().set_mtime(mtime, mtime_nsec);
@@ -94,11 +99,12 @@ fn clone_at<D: Disk, E: Disk, F: FnMut(u64)>(
             if !node_old.data().is_dir() {
                 let mut offset = 0;
                 loop {
-                    let count = tx_old.read_node_inner(&node_old, offset, buf)?;
+                    let count = tx_old.read_node(node_ptr_old, offset, buf, atime, atime_nsec)?;
                     if count == 0 {
                         break;
                     }
-                    tx.write_node_inner(&mut node, &mut offset, &buf[..count])?;
+                    tx.write_node(node.ptr(), offset, &buf[..count], mtime, mtime_nsec)?;
+                    offset += count as u64;
                 }
             }
 

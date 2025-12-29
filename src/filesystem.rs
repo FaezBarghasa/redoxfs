@@ -142,7 +142,10 @@ impl<D: Disk> FileSystem<D> {
             unsafe { fs.reset_allocator()? };
 
             // Squash allocations and sync
-            fs.tx(|tx| tx.commit(squash))?;
+            fs.tx(|tx| {
+                tx.sync_allocator(squash)?;
+                Ok(())
+            })?;
 
             return Ok(fs_mux.clone());
         }
@@ -208,10 +211,7 @@ impl<D: Disk> FileSystem<D> {
                 final_header = temp_header.clone();
                 final_header.generation = max_gen.into();
 
-                disk.write_at(
-                    journal_header.target_header_block.to_ne(),
-                    &final_header,
-                )?;
+                disk.write_at(journal_header.target_header_block.to_ne(), &final_header)?;
             }
 
             // Clear the journal entry
@@ -301,8 +301,10 @@ impl<D: Disk> FileSystem<D> {
         let fs_mux = Arc::new(Mutex::new(fs));
         let mut fs = fs_mux.lock();
 
-        unsafe {
-            fs.disk.write_at(fs.block, &fs.header)?;
+        {
+            let block = fs.block;
+            let header = fs.header;
+            fs.disk.write_at(block, &header)?;
         }
 
         fs.tx(|tx| unsafe {
@@ -334,7 +336,7 @@ impl<D: Disk> FileSystem<D> {
         })?;
 
         unsafe { fs.reset_allocator()? };
-
+        drop(fs);
         Ok(fs_mux)
     }
 

@@ -28,9 +28,9 @@ pub use self::file::DiskFile;
 pub use self::io::DiskIo;
 #[cfg(feature = "std")]
 pub use self::memory::DiskMemory;
+pub use self::mirror::DiskMirror;
 #[cfg(feature = "std")]
 pub use self::sparse::DiskSparse;
-pub use self::mirror::DiskMirror;
 
 #[cfg(feature = "std")]
 mod cache;
@@ -40,9 +40,9 @@ mod file;
 mod io;
 #[cfg(feature = "std")]
 mod memory;
+mod mirror;
 #[cfg(feature = "std")]
 mod sparse;
-mod mirror;
 
 /// The type of media, which can be used for optimization.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -97,7 +97,12 @@ pub trait Disk {
     /// - `block`: The block number to read from.
     /// - `buffer`: The buffer to read the data into.
     /// - `hint`: The type of block being read (Metadata or Data).
-    unsafe fn read_at_with_hint(&mut self, block: u64, buffer: &mut [u8], _hint: BlockTypeHint) -> Result<usize> {
+    unsafe fn read_at_with_hint(
+        &mut self,
+        block: u64,
+        buffer: &mut [u8],
+        _hint: BlockTypeHint,
+    ) -> Result<usize> {
         self.read_at(block, buffer)
     }
 
@@ -165,9 +170,17 @@ pub trait Disk {
     ///
     /// # Parameters
     ///
+    ///
     /// - `block`: The starting block number to trim.
     /// - `count`: The number of blocks to trim.
     fn trim(&mut self, _block: u64, _count: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Sync the disk, ensuring all previous writes are persisted.
+    ///
+    /// The default implementation does nothing.
+    fn sync(&mut self) -> Result<()> {
         Ok(())
     }
 }
