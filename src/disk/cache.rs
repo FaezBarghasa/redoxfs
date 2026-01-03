@@ -188,74 +188,158 @@ impl<T: Disk> Disk for DiskCache<T> {
         buffer: &mut [u8],
         _hint: BlockTypeHint,
     ) -> Result<usize> {
-        // We don't strictly need hint for ARC, but we could use it to prioritize if we wanted.
-        // For now, standard ARC is adaptive enough.
-
-        let mut read = 0;
-
-        // For simplicity, we assume reads are block-aligned or we cache full blocks
-        // The original code handled multi-block reads.
-
         let count = buffer.len().div_ceil(BLOCK_SIZE as usize);
+        let mut read = 0;
+        let mut i = 0;
 
-        for i in 0..count {
+        while i < count {
             let block_i = block + i as u64;
             let buffer_i = i * BLOCK_SIZE as usize;
             let len = cmp::min(BLOCK_SIZE as usize, buffer.len() - buffer_i);
 
-            // Try access (without data, just checking cache)
-            // My `access` function is a bit mixed (query vs update).
-            // If it returns Some, we have data.
-            // If it returns None, we might have updated state (ghost hit) or it's new.
+            // Check if block is in cache
+            // We use access(..., None) which updates LRU logic.
+            // If it returns Some, we have data. If None, we need to fetch.
+            // Note: access(..., None) handles Ghost Hits by updating 'p' and returning None (since we didn't provide data to promote).
+            // This is correct: we need to fetch data to resolve the ghost hit.
 
-            // Let's check if it's in T1/T2 first without mutating lists if we can?
-            // No, access should update LRU.
+            // To avoid cloning data just to check, we might want a peek?
+            // But access returns Option<[u8]>, which is Copy for array.
+            // 4KB copy is cheap compared to disk.
 
-            // But `access` expects data if it's a ghost hit to promote it?
-            // If we don't provide data, we can't promote.
-            // So we should check if it is in T1/T2.
-
-            let cached_data = if let Some(entry) = self.map.get(&block_i) {
-                match entry {
-                    CacheEntry::T1(d) | CacheEntry::T2(d) => Some(*d),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            if let Some(data) = cached_data {
-                // Hit! Update state.
-                self.access(block_i, Some(&data));
-                unsafe { ptr::copy(data.as_ptr(), buffer.as_mut_ptr().add(buffer_i), len) };
+            if let Some(data) = self.access(block_i, None) {
+                ptr::copy(data.as_ptr(), buffer.as_mut_ptr().add(buffer_i), len);
                 read += len;
+                i += 1;
             } else {
-                // Miss (or ghost hit).
-                // We need to read from disk.
-                // But we can't read just one block easily if we want to batch?
-                // The inner disk supports read_at.
-                // Let's just read this block.
+                // Miss. Coalesce contiguous misses.
+                let start_i = i;
+                let mut end_i = i + 1;
 
-                let mut disk_buf = [0u8; BLOCK_SIZE as usize];
-                self.inner.read_at(block_i, &mut disk_buf)?;
+                // Identify contiguous range of misses
+                // We peek map to avoid mutating LRU multiple times or extracting data we can't use yet?
+                // Actually, we SHOULD update LRU for all blocks we are about to read.
+                // But we don't have data yet.
+                // If we call access(..., None) it updates p if ghost hit.
+                // So calling it for range is fine.
+                while end_i < count {
+                    let next_block = block + end_i as u64;
+                    // Check if in map. detailed check (Data vs Ghost) is handled by access returning None.
+                    // But access(None) returns None for Ghost.
+                    // If it returns Some, it's a hit, so we stop coalescing.
 
-                // Now insert/update state.
-                // access with data will handle ghost hits or return None if new.
-                if self.access(block_i, Some(&disk_buf)).is_none() {
-                    // If access returned None, it means it wasn't a ghost hit (or map didn't have it).
-                    // So we insert as new.
-                    // Wait, if it was ghost hit, access(..., Some) SHOULD return Some.
-                    // Let's verify access logic.
-                    // "Miss in B1... Return None". Ah, my logic above was "Caller needs to fetch... insert into T2".
-                    // But if I pass data, I can insert it in access?
-                    // Yes, I updated access to insert if data provided.
+                    // Optimization: We can check self.map.contains_key first to avoid cloning data on Hit?
+                    // But we need to know if it's T1/T2 (Data) vs B1/B2 (Ghost).
+                    // map.get returns reference.
+                    let is_hit = if let Some(entry) = self.map.get(&next_block) {
+                        matches!(entry, CacheEntry::T1(_) | CacheEntry::T2(_))
+                    } else {
+                        false
+                    };
 
-                    // But if `access` returns None, it means "Totally new block" (not in map at all).
-                    self.insert(block_i, disk_buf);
+                    if is_hit {
+                        break;
+                    }
+                    end_i += 1;
                 }
 
-                unsafe { ptr::copy(disk_buf.as_ptr(), buffer.as_mut_ptr().add(buffer_i), len) };
-                read += len;
+                // Range start_i .. end_i is misses.
+                // Read from disk.
+
+                // READ-AHEAD LOGIC
+                // If the miss range extends to the end of request (end_i == count),
+                // we assume sequential read and fetch extra blocks.
+                let read_ahead = if end_i == count {
+                    // Primitive read-ahead: 128KB (32 blocks if 4KB)
+                    32
+                } else {
+                    0
+                };
+
+                let requested_blocks = end_i - start_i;
+                let total_blocks = requested_blocks + read_ahead;
+
+                let bytes_to_read = total_blocks * BLOCK_SIZE as usize;
+
+                // We need a buffer.
+                // Currently using a temporary Vec.
+                // For the 'requested' part, we could read directly to 'buffer',
+                // but for 'read_ahead' we need extra space.
+                // And `inner.read_at` expects a single slice.
+                // So we allocate.
+
+                let mut temp_buf = vec![0u8; bytes_to_read];
+
+                // Warning: inner.read_at might fail or return partial?
+                // Result<usize>
+                let read_res = self.inner.read_at(block + start_i as u64, &mut temp_buf)?;
+
+                // Distribute data
+                let blocks_read = read_res.div_ceil(BLOCK_SIZE as usize);
+
+                for k in 0..blocks_read {
+                    let blk_idx = start_i + k;
+                    let blk_num = block + blk_idx as u64;
+                    let buf_offset = k * BLOCK_SIZE as usize;
+
+                    if buf_offset >= temp_buf.len() {
+                        break;
+                    } // Should not happen
+
+                    let mut blk_data = [0u8; BLOCK_SIZE as usize];
+                    // Handle partial last block?
+                    let copy_len =
+                        cmp::min(BLOCK_SIZE as usize, read_res.saturating_sub(buf_offset));
+                    unsafe {
+                        ptr::copy(
+                            temp_buf.as_ptr().add(buf_offset),
+                            blk_data.as_mut_ptr(),
+                            copy_len,
+                        );
+                    }
+
+                    // Insert into cache
+                    // This handles LRU update, Ghost promotion, etc.
+                    // If it was a Ghost hit (access returned None but was B1/B2),
+                    // calling access(..., Some) will promote it.
+                    // If it was New, insert() will handle it.
+
+                    // We call access first with data?
+                    // access(..., Some(&data)) returns Some(&data) if it promotes or updates.
+                    // It returns None if it's "Totally new block".
+                    if self.access(blk_num, Some(&blk_data)).is_none() {
+                        self.insert(blk_num, blk_data);
+                    }
+
+                    // If this block was part of user request, copy to user buffer
+                    if blk_idx < count {
+                        let user_buf_i = blk_idx * BLOCK_SIZE as usize;
+                        let user_len = cmp::min(BLOCK_SIZE as usize, buffer.len() - user_buf_i);
+                        unsafe {
+                            ptr::copy(
+                                blk_data.as_ptr(),
+                                buffer.as_mut_ptr().add(user_buf_i),
+                                user_len,
+                            );
+                        }
+                        read += user_len;
+                    }
+                }
+
+                // If we read less than expected, stop?
+                if blocks_read < requested_blocks {
+                    // We failed to read all requested blocks.
+                    // Avoid infinite loop if we made no progress?
+                    if blocks_read == 0 {
+                        return Err(syscall::Error::new(syscall::EIO));
+                    }
+                    // Update i to continue from where we left off
+                    i += blocks_read;
+                    continue;
+                }
+
+                // Advance i
+                i = end_i;
             }
         }
 

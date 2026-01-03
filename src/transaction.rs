@@ -476,10 +476,56 @@ impl<'a, D: Disk> Transaction<'a, D> {
         &mut self,
         node: BlockPtr<T>,
     ) -> Result<TreePtr<T>> {
-        // The logic for generating new TreePtr IDs has changed.
-        // For now, I'll use a placeholder ID and mark this for review.
-        // TODO: Implement proper TreePtr ID generation.
-        let (i3, i2, i1, i0) = (0, 0, 0, 0); // Placeholder
+        // Allocate a new TreePtr ID by finding the first available slot
+        // We traverse the tree to find an empty (null) pointer slot
+        let mut found_slot = None;
+
+        // Search through all levels of the tree for an empty slot
+        'outer: for i3 in 0..126 {
+            let l3 = self.read_block(self.header.tree)?;
+            if l3.data().ptrs[i3].is_null() {
+                found_slot = Some((i3, 0, 0, 0));
+                break 'outer;
+            }
+
+            for i2 in 0..126 {
+                let l2_ptr = l3.data().ptrs[i3];
+                if l2_ptr.is_null() {
+                    continue;
+                }
+                let l2 = self.read_block(l2_ptr)?;
+                if l2.data().ptrs[i2].is_null() {
+                    found_slot = Some((i3, i2, 0, 0));
+                    break 'outer;
+                }
+
+                for i1 in 0..126 {
+                    let l1_ptr = l2.data().ptrs[i2];
+                    if l1_ptr.is_null() {
+                        continue;
+                    }
+                    let l1 = self.read_block(l1_ptr)?;
+                    if l1.data().ptrs[i1].is_null() {
+                        found_slot = Some((i3, i2, i1, 0));
+                        break 'outer;
+                    }
+
+                    for i0 in 0..126 {
+                        let l0_ptr = l1.data().ptrs[i1];
+                        if l0_ptr.is_null() {
+                            continue;
+                        }
+                        let l0 = self.read_block(l0_ptr)?;
+                        if l0.data().ptrs[i0].is_null() {
+                            found_slot = Some((i3, i2, i1, i0));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+
+        let (i3, i2, i1, i0) = found_slot.ok_or(Error::new(ENOSPC))?;
 
         unsafe {
             let mut l3 = self.shadow_block(self.header.tree)?;
@@ -501,9 +547,6 @@ impl<'a, D: Disk> Transaction<'a, D> {
             self.header_mut().tree = unsafe { self.write_block(l3)? };
         }
 
-        // The logic for updating unalloc_ptr is also outdated.
-        // TODO: Implement proper TreePtr ID generation.
-        // self.header_mut().unalloc_ptr = TreePtr::new(i3, i2, i1, i0).next().unwrap().into();
         self.set_header_changed(true);
 
         Ok(TreePtr::from_indexes((i3, i2, i1, i0)))
