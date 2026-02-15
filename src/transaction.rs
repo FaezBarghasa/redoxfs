@@ -13,10 +13,13 @@ use syscall::error::{
 };
 
 use crate::{
-    disk::BlockTypeHint, journal::JournalEntry, AllocEntry, AllocList, Allocator, BlockAddr,
-    BlockData, BlockLevel, BlockList, BlockMeta, BlockPtr, BlockRaw, BlockTrait, DirEntry, DirList,
-    Disk, FileSystem, Header, Node, NodeLevelData, TreeData, TreeList, TreePtr, ALLOC_GC_THRESHOLD,
-    BLOCK_SIZE, DIR_ENTRY_MAX_LENGTH, HEADER_RING, RECORD_LEVEL,
+    blinktree::{BLinkBlockType, BLinkLeaf, BLinkTree},
+    disk::BlockTypeHint,
+    journal::JournalEntry,
+    AllocEntry, AllocList, Allocator, BlockAddr, BlockData, BlockLevel, BlockList, BlockMeta,
+    BlockPtr, BlockRaw, BlockTrait, DirEntry, DirList, Disk, FileSystem, Header, Node,
+    NodeLevelData, TreeData, TreeList, TreePtr, ALLOC_GC_THRESHOLD, BLOCK_SIZE,
+    DIR_ENTRY_MAX_LENGTH, HEADER_RING, RECORD_LEVEL,
 };
 use std::cmp;
 
@@ -391,6 +394,16 @@ impl<'a, D: Disk> Transaction<'a, D> {
         Ok(changed)
     }
 
+    pub(crate) unsafe fn allocate(
+        &mut self,
+        ctx: &mut dyn AllocCtx,
+        meta: BlockMeta,
+    ) -> Option<BlockAddr> {
+        let addr = self.allocator.allocate(meta)?;
+        ctx.allocate(addr);
+        Some(addr)
+    }
+
     pub(crate) unsafe fn deallocate(&mut self, ctx: &mut dyn AllocCtx, addr: BlockAddr) {
         if self.allocator.decrement_refcount(addr) > 0 {
             return;
@@ -604,30 +617,15 @@ impl<'a, D: Disk> Transaction<'a, D> {
             return Err(Error::new(ENOTDIR));
         }
 
-        // 3. Read or create the parent's `DirList`.
-        let mut parent_dir_list_ptr = unsafe { level_data(&parent_node)?.level0[0].cast() };
-        let mut parent_dir_list = if parent_dir_list_ptr.is_null() {
-            BlockData::new(
-                self.allocator
-                    .allocate(BlockMeta::new(BlockLevel::L0))
-                    .ok_or(Error::new(ENOSPC))?,
-                DirList::empty(BlockLevel::L0).unwrap(),
-            )
-        } else {
-            self.read_block(parent_dir_list_ptr)?
-        };
-
-        // 4. Check for existing entries with the same name.
-        if parent_dir_list.data().find_entry(name).is_some() {
-            return Err(Error::new(EEXIST));
-        }
+        // 3. Read or create the parent's directory block.
+        let raw_ptr = unsafe { level_data(&parent_node)?.level0[0].cast::<BlockRaw>() };
 
         // 5. Create a new `Node` and allocate a block for it.
         let new_node_block_addr = self
             .allocator
             .allocate(BlockMeta::new(BlockLevel::L0))
             .ok_or(Error::new(ENOSPC))?;
-        let new_node_data = Node::new(mode, 0, 0, ctime, ctime_nsec); // uid, gid will be set later if needed
+        let new_node_data = Node::new(mode, 0, 0, ctime, ctime_nsec);
 
         // 6. Write the new node to disk.
         let new_node_block_data = BlockData::new(new_node_block_addr, new_node_data);
@@ -637,25 +635,114 @@ impl<'a, D: Disk> Transaction<'a, D> {
         let new_node_tree_ptr = self.insert_tree(new_node_block_ptr)?;
         let mut new_node_tree_data = self.read_tree(new_node_tree_ptr)?;
 
-        // 8. Create a `DirEntry` and append it to the parent's `DirList`.
+        // 8. Create a `DirEntry`.
         let dir_entry = DirEntry::new(new_node_tree_ptr, name);
-        if !parent_dir_list.data_mut().append(&dir_entry) {
-            // This should not happen if DIR_ENTRY_MAX_LENGTH is correctly sized
-            return Err(Error::new(ENOSPC));
+
+        if raw_ptr.is_null() {
+            // No directory block yet — create a BLinkLeaf directly
+            let mut leaf = BLinkLeaf::empty(BlockLevel::L0).ok_or(Error::new(EIO))?;
+            if !leaf.insert_entry(&dir_entry) {
+                return Err(Error::new(ENOSPC));
+            }
+            let addr = self
+                .allocator
+                .allocate(BlockMeta::new(BlockLevel::L0))
+                .ok_or(Error::new(ENOSPC))?;
+            let leaf_block = BlockData::new(addr, leaf);
+            let leaf_ptr = unsafe { self.write_block(leaf_block)? };
+            level_data_mut(&mut parent_node)?.level0[0] = unsafe { leaf_ptr.cast() };
+        } else {
+            // Read the block and detect its type
+            let block = self.read_block(raw_ptr)?;
+            let block_type = BLinkTree::block_type(block.data());
+
+            match block_type {
+                BLinkBlockType::Leaf => {
+                    // Already a B-Link leaf — insert directly
+                    let mut leaf_block: BlockData<BLinkLeaf> =
+                        self.read_block(unsafe { raw_ptr.cast() })?;
+
+                    match BLinkTree::insert_into_leaf(leaf_block.data_mut(), &dir_entry)? {
+                        None => {
+                            // Inserted without split
+                            let new_ptr = unsafe { self.write_block(leaf_block)? };
+                            level_data_mut(&mut parent_node)?.level0[0] = unsafe { new_ptr.cast() };
+                        }
+                        Some((_split_key, right_leaf)) => {
+                            // Split occurred — write both leaves
+                            // For now, store right leaf in level0[1] as a simple strategy
+                            let left_ptr = unsafe { self.write_block(leaf_block)? };
+                            let right_addr = self
+                                .allocator
+                                .allocate(BlockMeta::new(BlockLevel::L0))
+                                .ok_or(Error::new(ENOSPC))?;
+                            let right_block = BlockData::new(right_addr, right_leaf);
+                            let right_ptr = unsafe { self.write_block(right_block)? };
+                            let ld = level_data_mut(&mut parent_node)?;
+                            ld.level0[0] = unsafe { left_ptr.cast() };
+                            ld.level0[1] = unsafe { right_ptr.cast() };
+                        }
+                    }
+                }
+                _ => {
+                    // Legacy DirList or unknown — migrate to B-Link on write
+                    let dir_list_block: BlockData<DirList> =
+                        self.read_block(unsafe { raw_ptr.cast() })?;
+
+                    // Check for duplicate first
+                    if dir_list_block.data().find_entry(name).is_some() {
+                        return Err(Error::new(EEXIST));
+                    }
+
+                    // Migrate to BLinkLeaf
+                    let mut leaf = BLinkLeaf::from_dir_list(dir_list_block.data())?;
+
+                    // Insert the new entry
+                    match BLinkTree::insert_into_leaf(&mut leaf, &dir_entry)? {
+                        None => {
+                            // Deallocate old DirList block
+                            unsafe {
+                                self.deallocate(&mut FsCtx, raw_ptr.addr());
+                            }
+                            let addr = self
+                                .allocator
+                                .allocate(BlockMeta::new(BlockLevel::L0))
+                                .ok_or(Error::new(ENOSPC))?;
+                            let leaf_block = BlockData::new(addr, leaf);
+                            let leaf_ptr = unsafe { self.write_block(leaf_block)? };
+                            level_data_mut(&mut parent_node)?.level0[0] =
+                                unsafe { leaf_ptr.cast() };
+                        }
+                        Some((_split_key, right_leaf)) => {
+                            unsafe {
+                                self.deallocate(&mut FsCtx, raw_ptr.addr());
+                            }
+                            let left_addr = self
+                                .allocator
+                                .allocate(BlockMeta::new(BlockLevel::L0))
+                                .ok_or(Error::new(ENOSPC))?;
+                            let left_block = BlockData::new(left_addr, leaf);
+                            let left_ptr = unsafe { self.write_block(left_block)? };
+                            let right_addr = self
+                                .allocator
+                                .allocate(BlockMeta::new(BlockLevel::L0))
+                                .ok_or(Error::new(ENOSPC))?;
+                            let right_block = BlockData::new(right_addr, right_leaf);
+                            let right_ptr = unsafe { self.write_block(right_block)? };
+                            let ld = level_data_mut(&mut parent_node)?;
+                            ld.level0[0] = unsafe { left_ptr.cast() };
+                            ld.level0[1] = unsafe { right_ptr.cast() };
+                        }
+                    }
+                }
+            }
         }
 
-        // 9. Update and sync the parent's `DirList` and node.
+        // 9. Update and sync the parent node.
         parent_node.data_mut().set_mtime(ctime, ctime_nsec);
         parent_node.data_mut().set_atime(ctime, ctime_nsec);
-        parent_node
-            .data_mut()
-            .set_size(parent_dir_list.data().deref().len() as u64); // Update size based on DirList content
         let parent_blocks = parent_node.data().blocks();
-        parent_node.data_mut().set_blocks(parent_blocks + 1); // Account for the new node block
-
-        // Update parent's level0[0] to point to the new DirList
-        parent_dir_list_ptr = unsafe { self.write_block(parent_dir_list)? }.cast();
-        level_data_mut(&mut parent_node)?.level0[0] = unsafe { parent_dir_list_ptr.cast() };
+        parent_node.data_mut().set_blocks(parent_blocks + 1);
 
         self.sync_tree(parent_node)?;
 
@@ -1062,9 +1149,25 @@ impl<'a, D: Disk> Transaction<'a, D> {
         if let Some(level_data) = parent.data().level_data() {
             for ptr in level_data.level0.iter() {
                 if !ptr.is_null() {
-                    let dir_list_block = self.read_block(unsafe { ptr.cast::<DirList>() })?;
-                    if let Some(entry) = dir_list_block.data().find_entry(name) {
-                        return self.read_tree(entry.node_ptr());
+                    // Detect block type: B-Link leaf or legacy DirList
+                    let raw_block = self.read_block(unsafe { ptr.cast::<BlockRaw>() })?;
+                    let block_type = BLinkTree::block_type(raw_block.data());
+
+                    match block_type {
+                        BLinkBlockType::Leaf => {
+                            let leaf_block: BlockData<BLinkLeaf> =
+                                self.read_block(unsafe { ptr.cast() })?;
+                            if let Some(entry) = BLinkTree::search_leaf(leaf_block.data(), name) {
+                                return self.read_tree(entry.node_ptr());
+                            }
+                        }
+                        _ => {
+                            let dir_list_block =
+                                self.read_block(unsafe { ptr.cast::<DirList>() })?;
+                            if let Some(entry) = dir_list_block.data().find_entry(name) {
+                                return self.read_tree(entry.node_ptr());
+                            }
+                        }
                     }
                 }
             }
@@ -1085,9 +1188,24 @@ impl<'a, D: Disk> Transaction<'a, D> {
         if let Some(level_data) = parent.data().level_data() {
             for ptr in level_data.level0.iter() {
                 if !ptr.is_null() {
-                    let dir_list_block = self.read_block(unsafe { ptr.cast::<DirList>() })?;
-                    for entry in dir_list_block.data().entries() {
-                        children.push(entry);
+                    let raw_block = self.read_block(unsafe { ptr.cast::<BlockRaw>() })?;
+                    let block_type = BLinkTree::block_type(raw_block.data());
+
+                    match block_type {
+                        BLinkBlockType::Leaf => {
+                            let leaf_block: BlockData<BLinkLeaf> =
+                                self.read_block(unsafe { ptr.cast() })?;
+                            for entry in leaf_block.data().entries() {
+                                children.push(entry);
+                            }
+                        }
+                        _ => {
+                            let dir_list_block =
+                                self.read_block(unsafe { ptr.cast::<DirList>() })?;
+                            for entry in dir_list_block.data().entries() {
+                                children.push(entry);
+                            }
+                        }
                     }
                 }
             }
@@ -1107,14 +1225,35 @@ impl<'a, D: Disk> Transaction<'a, D> {
         if let Some(level_data) = parent.data_mut().level_data_mut() {
             for ptr in level_data.level0.iter_mut() {
                 if !ptr.is_null() {
-                    let mut dir_list_block = self.read_block(unsafe { ptr.cast::<DirList>() })?;
-                    if let Some(entry) = dir_list_block.data().find_entry(name) {
-                        entry_to_remove = Some(entry);
-                        if dir_list_block.data_mut().remove_entry(name) {
-                            let new_ptr = unsafe { self.write_block(dir_list_block)? };
-                            *ptr = unsafe { new_ptr.cast() };
-                            found = true;
-                            break;
+                    let raw_block = self.read_block(unsafe { ptr.cast::<BlockRaw>() })?;
+                    let block_type = BLinkTree::block_type(raw_block.data());
+
+                    match block_type {
+                        BLinkBlockType::Leaf => {
+                            let mut leaf_block: BlockData<BLinkLeaf> =
+                                self.read_block(unsafe { ptr.cast() })?;
+                            if let Some(entry) =
+                                BLinkTree::remove_from_leaf(leaf_block.data_mut(), name)
+                            {
+                                entry_to_remove = Some(entry);
+                                let new_ptr = unsafe { self.write_block(leaf_block)? };
+                                *ptr = unsafe { new_ptr.cast() };
+                                found = true;
+                                break;
+                            }
+                        }
+                        _ => {
+                            let mut dir_list_block =
+                                self.read_block(unsafe { ptr.cast::<DirList>() })?;
+                            if let Some(entry) = dir_list_block.data().find_entry(name) {
+                                entry_to_remove = Some(entry);
+                                if dir_list_block.data_mut().remove_entry(name) {
+                                    let new_ptr = unsafe { self.write_block(dir_list_block)? };
+                                    *ptr = unsafe { new_ptr.cast() };
+                                    found = true;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -1159,31 +1298,79 @@ impl<'a, D: Disk> Transaction<'a, D> {
         let mut new_parent_node = self.read_tree(new_parent)?;
         let mut added = false;
         if let Some(level_data) = new_parent_node.data_mut().level_data_mut() {
-            for ptr in level_data.level0.iter_mut() {
-                if !ptr.is_null() {
-                    let mut dir_list_block = self.read_block(unsafe { ptr.cast::<DirList>() })?;
-                    let entry = DirEntry::new(node_ptr, new_name);
-                    if dir_list_block.data_mut().append(&entry) {
-                        let new_block_ptr = unsafe { self.write_block(dir_list_block)? };
-                        *ptr = unsafe { new_block_ptr.cast() };
-                        added = true;
-                        break;
-                    }
-                } else {
-                    let addr = self
-                        .allocator
-                        .allocate(BlockMeta::new(BlockLevel::L0))
-                        .ok_or(Error::new(ENOSPC))?;
-                    let mut dir_list = DirList::empty(BlockLevel::L0).unwrap();
-                    let entry = DirEntry::new(node_ptr, new_name);
-                    dir_list.append(&entry);
+            let entry = DirEntry::new(node_ptr, new_name);
 
-                    let block_data = BlockData::new(addr, dir_list);
-                    let new_block_ptr = unsafe { self.write_block(block_data)? };
-                    *ptr = unsafe { new_block_ptr.cast() };
-                    added = true;
-                    break;
+            // Check first slot — it may be a B-Link leaf or DirList
+            let first_ptr = &mut level_data.level0[0];
+            if !first_ptr.is_null() {
+                let raw_block = self.read_block(unsafe { first_ptr.cast::<BlockRaw>() })?;
+                let block_type = BLinkTree::block_type(raw_block.data());
+
+                match block_type {
+                    BLinkBlockType::Leaf => {
+                        let mut leaf_block: BlockData<BLinkLeaf> =
+                            self.read_block(unsafe { first_ptr.cast() })?;
+                        match BLinkTree::insert_into_leaf(leaf_block.data_mut(), &entry)? {
+                            None => {
+                                let new_ptr = unsafe { self.write_block(leaf_block)? };
+                                *first_ptr = unsafe { new_ptr.cast() };
+                                added = true;
+                            }
+                            Some((_split_key, right_leaf)) => {
+                                let left_ptr = unsafe { self.write_block(leaf_block)? };
+                                let right_addr = self
+                                    .allocator
+                                    .allocate(BlockMeta::new(BlockLevel::L0))
+                                    .ok_or(Error::new(ENOSPC))?;
+                                let right_block = BlockData::new(right_addr, right_leaf);
+                                let right_ptr = unsafe { self.write_block(right_block)? };
+                                *first_ptr = unsafe { left_ptr.cast() };
+                                level_data.level0[1] = unsafe { right_ptr.cast() };
+                                added = true;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Legacy DirList path
+                        for ptr in level_data.level0.iter_mut() {
+                            if !ptr.is_null() {
+                                let mut dir_list_block =
+                                    self.read_block(unsafe { ptr.cast::<DirList>() })?;
+                                if dir_list_block.data_mut().append(&entry) {
+                                    let new_block_ptr =
+                                        unsafe { self.write_block(dir_list_block)? };
+                                    *ptr = unsafe { new_block_ptr.cast() };
+                                    added = true;
+                                    break;
+                                }
+                            } else {
+                                let addr = self
+                                    .allocator
+                                    .allocate(BlockMeta::new(BlockLevel::L0))
+                                    .ok_or(Error::new(ENOSPC))?;
+                                let mut dir_list = DirList::empty(BlockLevel::L0).unwrap();
+                                dir_list.append(&entry);
+                                let block_data = BlockData::new(addr, dir_list);
+                                let new_block_ptr = unsafe { self.write_block(block_data)? };
+                                *ptr = unsafe { new_block_ptr.cast() };
+                                added = true;
+                                break;
+                            }
+                        }
+                    }
                 }
+            } else {
+                // No directory block yet — create a B-Link leaf
+                let mut leaf = BLinkLeaf::empty(BlockLevel::L0).ok_or(Error::new(EIO))?;
+                leaf.insert_entry(&entry);
+                let addr = self
+                    .allocator
+                    .allocate(BlockMeta::new(BlockLevel::L0))
+                    .ok_or(Error::new(ENOSPC))?;
+                let leaf_block = BlockData::new(addr, leaf);
+                let leaf_ptr = unsafe { self.write_block(leaf_block)? };
+                *first_ptr = unsafe { leaf_ptr.cast() };
+                added = true;
             }
         }
         if !added {
@@ -1200,12 +1387,30 @@ impl<'a, D: Disk> Transaction<'a, D> {
         if let Some(level_data) = parent.data_mut().level_data_mut() {
             for ptr in level_data.level0.iter_mut() {
                 if !ptr.is_null() {
-                    let mut dir_list_block = self.read_block(unsafe { ptr.cast::<DirList>() })?;
-                    if dir_list_block.data_mut().remove_entry(name) {
-                        let new_ptr = unsafe { self.write_block(dir_list_block)? };
-                        *ptr = unsafe { new_ptr.cast() };
-                        self.sync_tree(parent)?;
-                        return Ok(());
+                    let raw_block = self.read_block(unsafe { ptr.cast::<BlockRaw>() })?;
+                    let block_type = BLinkTree::block_type(raw_block.data());
+
+                    match block_type {
+                        BLinkBlockType::Leaf => {
+                            let mut leaf_block: BlockData<BLinkLeaf> =
+                                self.read_block(unsafe { ptr.cast() })?;
+                            if BLinkTree::remove_from_leaf(leaf_block.data_mut(), name).is_some() {
+                                let new_ptr = unsafe { self.write_block(leaf_block)? };
+                                *ptr = unsafe { new_ptr.cast() };
+                                self.sync_tree(parent)?;
+                                return Ok(());
+                            }
+                        }
+                        _ => {
+                            let mut dir_list_block =
+                                self.read_block(unsafe { ptr.cast::<DirList>() })?;
+                            if dir_list_block.data_mut().remove_entry(name) {
+                                let new_ptr = unsafe { self.write_block(dir_list_block)? };
+                                *ptr = unsafe { new_ptr.cast() };
+                                self.sync_tree(parent)?;
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }

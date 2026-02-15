@@ -304,7 +304,7 @@ impl<D: Disk> FileSystem<D> {
         {
             let block = fs.block;
             let header = fs.header;
-            fs.disk.write_at(block, &header)?;
+            unsafe { fs.disk.write_at(block, &header)? };
         }
 
         fs.tx(|tx| unsafe {

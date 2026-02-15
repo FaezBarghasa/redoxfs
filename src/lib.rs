@@ -48,7 +48,7 @@ pub use self::clone::clone;
 pub use self::dir::{DirEntry, DirList};
 pub use self::disk::*;
 pub use self::filesystem::FileSystem;
-pub use self::header::{Header};
+pub use self::header::Header;
 pub use self::key::{Key, KeySlot, Salt};
 #[cfg(feature = "std")]
 pub use self::mount::mount;
@@ -86,9 +86,11 @@ mod unmount;
 mod quota;
 
 // New Modules
-pub mod journal;
+pub mod blinktree;
 #[cfg(feature = "std")]
 pub mod driver;
+pub mod journal;
+pub mod shard;
 
 #[cfg(all(feature = "std", test))]
 mod tests;
