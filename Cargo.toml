@@ -59,6 +59,7 @@ path = "tests/recovery.rs"
 required-features = ["std"]
 
 [dependencies]
+seahash = { version = "4.1.0", default-features = false }m
 aes = { version = "0.9.1", default-features = false }
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
 base64ct = { version = "1", default-features = false }
@@ -76,20 +77,23 @@ lz4_flex = { version = "0.13.1", default-features = false, features = [
 parse-size = { version = "1", optional = true }
 range-tree = { version = "0.1", optional = true }
 redox_syscall = "0.8.1"
-seahash = { version = "4.1.0", default-features = false }
-spin = "0.10.0"
+spin = "0.12.0"
 termion = { version = "4", optional = true }
 uuid = { version = "1.4", default-features = false }
 xts-mode = { version = "0.6.0", default-features = false }
-crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
+crossbeam-queue = { version = "0.3", default-features = false, features = [
+    "alloc",
+] }
 blake3 = { version = "1.5.1", default-features = false }
-zerocopy = { version = "0.7.35", default-features = false, features = ["derive"] }
+zerocopy = { version = "0.8.52", default-features = false, features = [
+    "derive",
+] }
+
 
 [features]
 default = ["std", "log", "fuse"]
 fuse = ["fuser", "std"]
 std = [
-    "log",
     "env_logger",
     "getrandom",
     "humansize",
