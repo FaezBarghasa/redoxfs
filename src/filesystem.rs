@@ -55,7 +55,7 @@ impl<D: Disk> FileSystem<D> {
         self.cipher_opt.as_ref()
     }
 
-    pub(crate) unsafe fn allocator_mut(&mut self) -> &mut Allocator {
+    pub unsafe fn allocator_mut(&mut self) -> &mut Allocator {
         &mut self.allocator
     }
 
@@ -307,6 +307,7 @@ impl<D: Disk> FileSystem<D> {
             unsafe { fs.disk.write_at(block, &header)? };
         }
 
+        println!("create_reserved: Starting transaction 1");
         fs.tx(|tx| unsafe {
             let tree = BlockData::new(
                 BlockAddr::new(METADATA_START_BLOCK + 0, BlockMeta::default()),
@@ -323,19 +324,33 @@ impl<D: Disk> FileSystem<D> {
             tx.header_mut().tree = tx.write_block(tree)?;
             tx.header_mut().alloc = tx.write_block(alloc)?;
 
+            tx.set_header_changed(true);
+            Ok(())
+        })?;
+
+        println!("create_reserved: Starting reset_allocator 1");
+        unsafe { fs.reset_allocator()? };
+
+        println!("create_reserved: Starting transaction 2");
+        fs.tx(|tx| unsafe {
+            println!("create_reserved: tx.header().tree={:?}", tx.header().tree);
+            println!("create_reserved: tx.header().alloc={:?}", tx.header().alloc);
             let mut root = BlockData::new(
                 BlockAddr::new(METADATA_START_BLOCK + 2, BlockMeta::default()),
                 Node::new(Node::MODE_DIR | 0o755, 0, 0, ctime, ctime_nsec),
             );
             root.data_mut().set_links(1);
             let root_ptr = tx.write_block(root)?;
+            println!("create_reserved: root_ptr={:?}", root_ptr);
             assert_eq!(tx.insert_tree(root_ptr)?.id(), 1);
 
             tx.set_header_changed(true);
             Ok(())
         })?;
 
+        println!("create_reserved: Starting reset_allocator 2");
         unsafe { fs.reset_allocator()? };
+        println!("create_reserved: Finished successfully");
         drop(fs);
         Ok(fs_mux)
     }
@@ -377,6 +392,13 @@ impl<D: Disk> FileSystem<D> {
 
         for alloc in allocs {
             for entry in alloc.data().entries.iter() {
+                if !entry.is_null() {
+                    println!(
+                        "reset_allocator: entry index={}, count={}",
+                        entry.index(),
+                        entry.count()
+                    );
+                }
                 let index = entry.index();
                 let count = entry.count();
                 if count < 0 {

@@ -36,7 +36,7 @@ pub struct Header {
     /// Key slots
     pub key_slots: [KeySlot; 64],
     /// Padding (Reduced by 32 bytes for refcount_table_root)
-    pub padding: [u8; BLOCK_SIZE as usize - 3176 - 96 - 32],
+    pub padding: [u8; BLOCK_SIZE as usize - 3224],
     /// encrypted hash of header data without hash
     pub encrypted_hash: [u8; 16],
     /// hash of header data without hash
@@ -87,25 +87,26 @@ impl Header {
         let end = mem::size_of_val(self)
             - mem::size_of_val(&{ self.hash })
             - mem::size_of_val(&{ self.encrypted_hash });
-        seahash::hash(&self[..end])
+        let bytes = unsafe { slice::from_raw_parts(self as *const Header as *const u8, end) };
+        let hash_bytes = blake3::hash(bytes);
+        u64::from_le_bytes(hash_bytes.as_bytes()[0..8].try_into().unwrap())
     }
 
     fn create_encrypted_hash(&self, cipher_opt: Option<&Xts128<Aes128>>) -> [u8; 16] {
-        let mut encrypted_hash = [0; 16];
-        for (i, b) in self.hash.to_le_bytes().iter().enumerate() {
-            encrypted_hash[i] = *b;
-        }
+        let mut hash = [0; 16];
+        let bytes = self.hash.to_le_bytes();
+        hash[..bytes.len()].copy_from_slice(&bytes);
         if let Some(cipher) = cipher_opt {
-            let mut block = aes::Block::from(encrypted_hash);
+            let mut block = aes::Block::from(hash);
             cipher.encrypt_area(
                 &mut block,
                 BLOCK_SIZE as usize,
                 self.generation().into(),
                 get_tweak_default,
             );
-            encrypted_hash = block.into();
+            hash = block.into();
         }
-        encrypted_hash
+        hash
     }
 
     pub fn encrypted(&self) -> bool {
@@ -160,7 +161,7 @@ impl Default for Header {
             quota_table_root: BlockPtr::default(),
             refcount_table_root: BlockPtr::default(),
             key_slots: [KeySlot::default(); 64],
-            padding: [0; BLOCK_SIZE as usize - 3176 - 96 - 32],
+            padding: [0; BLOCK_SIZE as usize - 3224],
             encrypted_hash: [0; 16],
             hash: 0.into(),
         }

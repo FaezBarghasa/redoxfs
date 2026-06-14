@@ -1,6 +1,7 @@
 // src/bin/mount.rs
 extern crate libc;
 extern crate redoxfs;
+extern crate log;
 #[cfg(target_os = "redox")]
 extern crate syscall;
 extern crate uuid;
@@ -169,8 +170,12 @@ fn filesystem_by_path(
 
         match DiskFile::open(path).map(DiskCache::new) {
             Ok(disk) => {
-                match redoxfs::FileSystem::open(disk, password_opt.as_deref(), block_opt, true, false) {
-                    Ok(filesystem) => {
+                match redoxfs::FileSystem::open(disk, password_opt.as_deref(), block_opt, true) {
+                    Ok(fs_mux) => {
+                        let filesystem = std::sync::Arc::try_unwrap(fs_mux)
+                            .ok()
+                            .expect("FileSystem Arc has multiple references")
+                            .into_inner();
                         log::debug!(
                             "opened filesystem on {} with uuid {}",
                             path,

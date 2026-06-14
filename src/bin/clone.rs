@@ -50,7 +50,7 @@ fn main() {
         }
     };
 
-    let mut fs_old = match FileSystem::open(disk_old, None, None, false, false) {
+    let fs_old_mux = match FileSystem::open(disk_old, None, None, false) {
         Ok(fs) => fs,
         Err(err) => {
             println!(
@@ -60,6 +60,7 @@ fn main() {
             process::exit(1);
         }
     };
+    let mut fs_old = fs_old_mux.lock();
 
     let disk = match DiskFile::open(&disk_path) {
         Ok(disk) => disk,
@@ -96,13 +97,12 @@ fn main() {
     };
 
     let ctime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    let mut fs = match FileSystem::create_reserved(
+    let fs_mux = match FileSystem::create_reserved(
         disk,
         None,
         &bootloader,
         ctime.as_secs(),
         ctime.subsec_nanos(),
-        false,
     ) {
         Ok(fs) => fs,
         Err(err) => {
@@ -113,6 +113,7 @@ fn main() {
             process::exit(1);
         }
     };
+    let mut fs = fs_mux.lock();
 
     let size_old = fs_old.header().size();
     let free_old = fs_old.allocator().free() * redoxfs::BLOCK_SIZE;

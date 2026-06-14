@@ -156,15 +156,32 @@ impl<'a, D: Disk> Transaction<'a, D> {
         // Allocate a new block and move the data.
         let old_addr = ptr.addr();
         let new_addr = self
-            .allocator
-            .allocate(old_addr.meta())
-            .ok_or(Error::new(ENOSPC))?;
+            .allocate(&mut FsCtx, old_addr.meta())
+            .ok_or_else(|| {
+                println!("shadow_block ENOSPC: old_addr={:?}, free={}", old_addr, self.allocator.free());
+                Error::new(ENOSPC)
+            })?;
         block.swap_addr(new_addr);
 
         // Deallocate the old block
         self.deallocate(&mut FsCtx, old_addr);
 
         Ok(block)
+    }
+
+    pub(crate) unsafe fn shadow_or_alloc_block<T: BlockTrait + DerefMut<Target = [u8]>>(
+        &mut self,
+        ptr: BlockPtr<T>,
+    ) -> Result<BlockData<T>> {
+        if ptr.is_null() {
+            let addr = self
+                .allocate(&mut FsCtx, BlockMeta::default())
+                .ok_or(Error::new(ENOSPC))?;
+            let empty = T::empty(BlockLevel::default()).ok_or(Error::new(ENOENT))?;
+            Ok(BlockData::new(addr, empty))
+        } else {
+            self.shadow_block(ptr)
+        }
     }
 
     pub(crate) unsafe fn write_block<T: BlockTrait + Deref<Target = [u8]>>(
@@ -194,18 +211,40 @@ impl<'a, D: Disk> Transaction<'a, D> {
             return Err(Error::new(ENOENT));
         }
 
+        println!(
+            "read_block_with_hint: reading {:?}, write_cache keys: {:?}",
+            ptr.addr(),
+            self.write_cache.keys().collect::<Vec<_>>()
+        );
+
         let mut data = T::empty(ptr.addr().level()).ok_or(Error::new(ENOENT))?;
         if let Some(raw) = self.write_cache.get(&ptr.addr()) {
             data.copy_from_slice(raw);
             let block = BlockData::new(ptr.addr(), data);
-            if block.create_ptr().hash() == ptr.hash() {
+            let calc = block.create_ptr().hash();
+            if calc == ptr.hash() {
                 return Ok(block);
+            } else {
+                println!(
+                    "read_block_with_hint: write_cache hit for {:?}, but HASH MISMATCH! Expected {}, got {}",
+                    ptr.addr(),
+                    ptr.hash(),
+                    calc
+                );
             }
         } else if let Some(raw) = self.shadow_cache.get(&ptr.addr()) {
             data.copy_from_slice(raw);
             let block = BlockData::new(ptr.addr(), data);
-            if block.create_ptr().hash() == ptr.hash() {
+            let calc = block.create_ptr().hash();
+            if calc == ptr.hash() {
                 return Ok(block);
+            } else {
+                println!(
+                    "read_block_with_hint: shadow_cache hit for {:?}, but HASH MISMATCH! Expected {}, got {}",
+                    ptr.addr(),
+                    ptr.hash(),
+                    calc
+                );
             }
         } else {
             let block_offset = self.fs.block();
@@ -218,11 +257,46 @@ impl<'a, D: Disk> Transaction<'a, D> {
             };
             self.fs.decrypt(&mut data, ptr.addr());
             let block = BlockData::new(ptr.addr(), data);
-            if block.create_ptr().hash() == ptr.hash() {
+            let calculated = block.create_ptr().hash();
+            if calculated == ptr.hash() {
                 return Ok(block);
+            } else {
+                println!(
+                    "read_block_with_hint: disk read for {:?}, but HASH MISMATCH! Expected {}, got {}",
+                    ptr.addr(),
+                    ptr.hash(),
+                    calculated
+                );
+            }
+
+            // Self-healing from mirrors if checksum failed
+            for mirror_idx in 0..2 {
+                let mut temp_data = T::empty(ptr.addr().level()).ok_or(Error::new(ENOENT))?;
+                unsafe {
+                    if let Ok(_) = self.fs.disk().read_mirror_at(
+                        mirror_idx,
+                        block_offset + ptr.addr().index(),
+                        &mut temp_data,
+                    ) {
+                        self.fs.decrypt(&mut temp_data, ptr.addr());
+                        let temp_block = BlockData::new(ptr.addr(), temp_data);
+                        if temp_block.create_ptr().hash() == ptr.hash() {
+                            println!("read_block_with_hint: healed from mirror {}", mirror_idx);
+                            // Correct block found on mirror_idx!
+                            let mut write_buf = temp_block.data().deref().to_vec();
+                            self.fs.encrypt(&mut write_buf, ptr.addr());
+                            self.fs.disk().write_at(
+                                block_offset + ptr.addr().index(),
+                                &write_buf,
+                            )?;
+                            return Ok(temp_block);
+                        }
+                    }
+                }
             }
         }
 
+        println!("read_block_with_hint: returning EIO");
         Err(Error::new(EIO))
     }
 
@@ -262,10 +336,12 @@ impl<'a, D: Disk> Transaction<'a, D> {
             }
 
             self.fs.encrypt(raw, *addr);
+            let hash_bytes = blake3::hash(raw);
+            let hash_u64 = u64::from_le_bytes(hash_bytes.as_bytes()[0..8].try_into().unwrap());
             let entry = JournalEntry {
                 block_index: (*addr).index().into(),
                 generation: next_gen.into(),
-                hash: seahash::hash(raw).into(),
+                hash: hash_u64.into(),
             };
             journal_header.entries[i] = entry;
             unsafe { self.fs.disk().write_at(journal_data_block, raw.as_ref())? };
@@ -361,19 +437,36 @@ impl<'a, D: Disk> Transaction<'a, D> {
             }
         }
 
+        println!("sync_allocator: allocator_log len={}", self.allocator_log.len());
+        for (idx, alloc) in allocs.iter().enumerate() {
+            let non_null_count = alloc.data().entries.iter().filter(|e| !e.is_null()).count();
+            println!("sync_allocator: allocs[{}] addr={:?}, non-null entries={}", idx, alloc.addr(), non_null_count);
+        }
+
         if !self.allocator_log.is_empty() {
             changed = true;
             'allocator_log: while let Some(entry) = self.allocator_log.pop_front() {
-                for alloc in allocs.iter_mut() {
+                println!("sync_allocator: processing log entry index={}, count={}", entry.index(), entry.count());
+                let mut inserted = false;
+                for (idx, alloc) in allocs.iter_mut().enumerate() {
                     if alloc.data_mut().insert_entry(entry) {
-                        continue 'allocator_log;
+                        println!("sync_allocator: successfully inserted into allocs[{}] addr={:?}", idx, alloc.addr());
+                        inserted = true;
+                        break;
                     }
                 }
+                if inserted {
+                    continue 'allocator_log;
+                }
 
+                println!("sync_allocator: no space in existing allocs, allocating new AllocList block!");
                 let mut alloc = unsafe {
-                    let mut alloc = self.read_block(self.header.alloc)?;
-                    alloc.data_mut().prev = self.header.alloc;
-                    self.shadow_block(alloc.create_ptr())?
+                    let addr = self
+                        .allocate(&mut FsCtx, BlockMeta::default())
+                        .ok_or(Error::new(ENOSPC))?;
+                    println!("sync_allocator: allocated new block addr={:?}", addr);
+                    let empty = AllocList::empty(BlockLevel::default()).ok_or(Error::new(ENOENT))?;
+                    BlockData::new(addr, empty)
                 };
 
                 assert!(alloc.data_mut().insert_entry(entry));
@@ -384,7 +477,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
         if changed {
             let mut next_ptr = BlockPtr::default();
             for mut alloc in allocs.into_iter().rev() {
-                // alloc.data_mut().next = next_ptr; // REMOVED THIS LINE
+                alloc.data_mut().prev = next_ptr;
                 next_ptr = unsafe { self.write_block(alloc)? };
             }
             self.header_mut().alloc = next_ptr;
@@ -401,6 +494,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
     ) -> Option<BlockAddr> {
         let addr = self.allocator.allocate(meta)?;
         ctx.allocate(addr);
+        self.allocator_log.push_back(AllocEntry::allocate(addr));
         Some(addr)
     }
 
@@ -523,7 +617,8 @@ impl<'a, D: Disk> Transaction<'a, D> {
                         break 'outer;
                     }
 
-                    for i0 in 0..126 {
+                    let start_i0 = if i3 == 0 && i2 == 0 && i1 == 0 { 1 } else { 0 };
+                    for i0 in start_i0..126 {
                         let l0_ptr = l1.data().ptrs[i1];
                         if l0_ptr.is_null() {
                             continue;
@@ -538,13 +633,16 @@ impl<'a, D: Disk> Transaction<'a, D> {
             }
         }
 
-        let (i3, i2, i1, i0) = found_slot.ok_or(Error::new(ENOSPC))?;
+        let (mut i3, mut i2, mut i1, mut i0) = found_slot.ok_or(Error::new(ENOSPC))?;
+        if (i3, i2, i1, i0) == (0, 0, 0, 0) {
+            i0 = 1;
+        }
 
         unsafe {
             let mut l3 = self.shadow_block(self.header.tree)?;
-            let mut l2 = self.shadow_block(l3.data().ptrs[i3])?;
-            let mut l1 = self.shadow_block(l2.data().ptrs[i2])?;
-            let mut l0 = self.shadow_block(l1.data().ptrs[i1])?;
+            let mut l2 = self.shadow_or_alloc_block(l3.data().ptrs[i3])?;
+            let mut l1 = self.shadow_or_alloc_block(l2.data().ptrs[i2])?;
+            let mut l0 = self.shadow_or_alloc_block(l1.data().ptrs[i1])?;
 
             l0.data_mut().ptrs[i0] = unsafe { node.cast() };
 
@@ -794,49 +892,204 @@ impl<'a, D: Disk> Transaction<'a, D> {
             }
         }
 
-        // Handle data blocks (only L0 for now)
+        let compression_hint = node.data().compression_hint();
+
+        // Handle data blocks
         if !remaining_buf.is_empty() {
             let block_size = BLOCK_SIZE as u64;
             let start_block_idx = current_offset / block_size;
 
-            // For simplicity, only support L0 blocks for now.
-            // If the write goes beyond L0, return ERANGE.
             if start_block_idx >= 56 {
-                // 56 is the number of L0 blocks in NodeLevelData
                 return Err(Error::new(ERANGE));
             }
 
             let level_data_mut_ref = level_data_mut(&mut node)?;
-            let mut block_idx = start_block_idx;
-            while !remaining_buf.is_empty() && block_idx < 56 {
-                let block_offset_in_node = block_idx * block_size;
+            
+            while !remaining_buf.is_empty() {
+                let block_idx = (current_offset / block_size) as usize;
+                if block_idx >= 56 {
+                    return Err(Error::new(ERANGE));
+                }
+
+                // Check if this block_idx falls inside an existing compressed block
+                let mut covered_compressed = None;
+                for i in 0..56 {
+                    let p = level_data_mut_ref.level0[i];
+                    if !p.is_null() {
+                        if let Some(decomp_level) = p.addr().decomp_level() {
+                            let decomp_blocks = decomp_level.blocks::<u32>() as usize;
+                            if i <= block_idx && block_idx < i + decomp_blocks {
+                                covered_compressed = Some((p, i, decomp_level));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some((p, comp_start_idx, decomp_level)) = covered_compressed {
+                    // 1. Decompress the existing compressed block
+                    let comp_block = self.read_block(unsafe { p.cast::<BlockRaw>() })?;
+                    let compressed_len = u32::from_le_bytes(comp_block.data()[0..4].try_into().unwrap()) as usize;
+                    let mut decompressed = lz4_flex::block::decompress(
+                        &comp_block.data()[4..4 + compressed_len],
+                        (decomp_level.blocks::<u32>() * BLOCK_SIZE as u32) as usize,
+                    )
+                    .map_err(|_| Error::new(EIO))?;
+
+                    // 2. Modify decompressed data with write buffer
+                    let decomp_offset = (current_offset - comp_start_idx as u64 * block_size) as usize;
+                    let decomp_rem = decompressed.len() - decomp_offset;
+                    let len_to_write = min(remaining_buf.len(), decomp_rem);
+
+                    decompressed[decomp_offset..decomp_offset + len_to_write]
+                        .copy_from_slice(&remaining_buf[..len_to_write]);
+
+                    // 3. Try to recompress
+                    if compression_hint == 1 {
+                        let compressed = lz4_flex::block::compress(&decompressed);
+                        let compressed_len = compressed.len() as u64;
+                        let mut comp_level_opt = None;
+                        for c in 0..decomp_level.0 {
+                            if compressed_len + 4 <= (1 << c) * BLOCK_SIZE {
+                                comp_level_opt = Some(BlockLevel(c));
+                                break;
+                            }
+                        }
+                        if let Some(comp_level) = comp_level_opt {
+                            // Write compressed
+                            let new_block_addr = unsafe {
+                                self.allocate(&mut FsCtx, BlockMeta::new_compressed(comp_level, decomp_level))
+                            }
+                            .ok_or(Error::new(ENOSPC))?;
+
+                            let comp_block_size = comp_level.blocks::<u32>() as u64 * BLOCK_SIZE;
+                            let mut block_data = vec![0u8; comp_block_size as usize];
+                            block_data[0..4].copy_from_slice(&(compressed.len() as u32).to_le_bytes());
+                            block_data[4..4 + compressed.len()].copy_from_slice(&compressed);
+
+                            let raw_block = BlockData::new(new_block_addr, BlockRaw::empty(comp_level).unwrap());
+                            unsafe {
+                                let raw_slice = core::slice::from_raw_parts_mut(
+                                    raw_block.data().deref().as_ptr() as *mut u8,
+                                    comp_block_size as usize,
+                                );
+                                raw_slice.copy_from_slice(&block_data);
+                            }
+
+                            let new_block_ptr = unsafe { self.write_block(raw_block)? };
+                            level_data_mut_ref.level0[comp_start_idx] = unsafe { new_block_ptr.cast() };
+                            for i in 1..decomp_level.blocks::<u32>() as usize {
+                                level_data_mut_ref.level0[comp_start_idx + i] = BlockPtr::default();
+                            }
+
+                            unsafe { self.deallocate(&mut FsCtx, p.addr()); }
+
+                            bytes_written += len_to_write;
+                            current_offset += len_to_write as u64;
+                            remaining_buf = &remaining_buf[len_to_write..];
+                            continue;
+                        }
+                    }
+
+                    // If we can't compress or hint is disabled, write as uncompressed L0 blocks
+                    let decomp_blocks = decomp_level.blocks::<u32>() as usize;
+                    for i in 0..decomp_blocks {
+                        let idx = comp_start_idx + i;
+                        let old_p = level_data_mut_ref.level0[idx];
+                        let mut new_block_data = BlockData::new(
+                            unsafe { self.allocate(&mut FsCtx, BlockMeta::new(BlockLevel::L0)) }.ok_or(Error::new(ENOSPC))?,
+                            BlockRaw::empty(BlockLevel::L0).unwrap(),
+                        );
+                        new_block_data.data_mut().copy_from_slice(
+                            &decompressed[i * BLOCK_SIZE as usize..(i + 1) * BLOCK_SIZE as usize],
+                        );
+                        let new_ptr = unsafe { self.write_block(new_block_data)? };
+                        level_data_mut_ref.level0[idx] = unsafe { new_ptr.cast() };
+                        if !old_p.is_null() && i == 0 {
+                            unsafe { self.deallocate(&mut FsCtx, old_p.addr()); }
+                        }
+                    }
+
+                    bytes_written += len_to_write;
+                    current_offset += len_to_write as u64;
+                    remaining_buf = &remaining_buf[len_to_write..];
+                    continue;
+                }
+
+                // If not in compressed block, check if we want to compress this write
+                if compression_hint == 1 && current_offset % BLOCK_SIZE == 0 {
+                    let write_blocks = remaining_buf.len() as u64 / BLOCK_SIZE;
+                    if write_blocks > 1 && write_blocks.is_power_of_two() {
+                        let decomp_level = BlockLevel(write_blocks.trailing_zeros() as usize);
+                        let compressed = lz4_flex::block::compress(&remaining_buf[..write_blocks as usize * BLOCK_SIZE as usize]);
+                        let compressed_len = compressed.len() as u64;
+                        let mut comp_level_opt = None;
+                        for c in 0..decomp_level.0 {
+                            if compressed_len + 4 <= (1 << c) * BLOCK_SIZE {
+                                comp_level_opt = Some(BlockLevel(c));
+                                break;
+                            }
+                        }
+                        if let Some(comp_level) = comp_level_opt {
+                            let new_block_addr = unsafe {
+                                self.allocate(&mut FsCtx, BlockMeta::new_compressed(comp_level, decomp_level))
+                            }
+                            .ok_or(Error::new(ENOSPC))?;
+
+                            let comp_block_size = comp_level.blocks::<u32>() as u64 * BLOCK_SIZE;
+                            let mut block_data = vec![0u8; comp_block_size as usize];
+                            block_data[0..4].copy_from_slice(&(compressed.len() as u32).to_le_bytes());
+                            block_data[4..4 + compressed.len()].copy_from_slice(&compressed);
+
+                            let raw_block = BlockData::new(new_block_addr, BlockRaw::empty(comp_level).unwrap());
+                            unsafe {
+                                let raw_slice = core::slice::from_raw_parts_mut(
+                                    raw_block.data().deref().as_ptr() as *mut u8,
+                                    comp_block_size as usize,
+                                );
+                                raw_slice.copy_from_slice(&block_data);
+                            }
+
+                            let new_block_ptr = unsafe { self.write_block(raw_block)? };
+                            level_data_mut_ref.level0[block_idx] = unsafe { new_block_ptr.cast() };
+                            for i in 1..decomp_level.blocks::<u32>() as usize {
+                                level_data_mut_ref.level0[block_idx + i] = BlockPtr::default();
+                            }
+
+                            let len = decomp_level.blocks::<u64>() * BLOCK_SIZE;
+                            bytes_written += len as usize;
+                            current_offset += len;
+                            remaining_buf = &remaining_buf[len as usize..];
+                            continue;
+                        }
+                    }
+                }
+
+                // Normal write of a single block
+                let block_offset_in_node = block_idx as u64 * block_size;
                 let offset_in_block = (current_offset - block_offset_in_node) as usize;
+                let len_to_write_in_block = min(remaining_buf.len(), BLOCK_SIZE as usize - offset_in_block);
 
-                let len_to_write_in_block =
-                    min(remaining_buf.len(), block_size as usize - offset_in_block);
-
-                let current_block_ptr = level_data_mut_ref.level0[block_idx as usize];
+                let current_block_ptr = level_data_mut_ref.level0[block_idx];
                 let mut current_block_data = if current_block_ptr.is_null() {
-                    let new_block_addr = self
-                        .allocator
-                        .allocate(BlockMeta::new(BlockLevel::L0))
-                        .ok_or(Error::new(ENOSPC))?;
+                    let new_block_addr = unsafe {
+                        self.allocate(&mut FsCtx, BlockMeta::new(BlockLevel::L0))
+                    }
+                    .ok_or(Error::new(ENOSPC))?;
                     BlockData::new(new_block_addr, BlockRaw::empty(BlockLevel::L0).unwrap())
                 } else {
                     self.read_block(unsafe { current_block_ptr.cast() })?
                 };
 
-                current_block_data.data_mut()
-                    [offset_in_block..offset_in_block + len_to_write_in_block]
+                current_block_data.data_mut()[offset_in_block..offset_in_block + len_to_write_in_block]
                     .copy_from_slice(&remaining_buf[..len_to_write_in_block]);
 
                 let new_block_ptr = unsafe { self.write_block(current_block_data)? };
-                level_data_mut_ref.level0[block_idx as usize] = unsafe { new_block_ptr.cast() };
+                level_data_mut_ref.level0[block_idx] = unsafe { new_block_ptr.cast() };
 
                 bytes_written += len_to_write_in_block;
                 current_offset += len_to_write_in_block as u64;
                 remaining_buf = &remaining_buf[len_to_write_in_block..];
-                block_idx += 1;
             }
         }
 
@@ -1111,19 +1364,41 @@ impl<'a, D: Disk> Transaction<'a, D> {
             let to_read = cmp::min(buf.len() - i, remaining_in_block);
 
             if let Some(level_data) = node.data().level_data() {
-                if block_index < 56 {
-                    let ptr = level_data.level0[block_index as usize];
-                    if ptr.is_null() {
-                        for b in &mut buf[i..i + to_read] {
-                            *b = 0;
+                // Find if there is any compressed or normal block covering block_index
+                let mut found_ptr = None;
+                for idx in 0..56 {
+                    let p = level_data.level0[idx];
+                    if !p.is_null() {
+                        let decomp_blocks = p.addr().decomp_level().unwrap_or(BlockLevel(1)).blocks::<u64>();
+                        if idx as u64 <= block_index && block_index < idx as u64 + decomp_blocks {
+                            found_ptr = Some((p, idx as u64));
+                            break;
                         }
+                    }
+                }
+
+                if let Some((p, start_idx)) = found_ptr {
+                    if p.addr().decomp_level().is_some() {
+                        let decomp_level = p.addr().decomp_level().unwrap();
+                        let comp_block = self.read_block(unsafe { p.cast::<BlockRaw>() })?;
+                        let compressed_len = u32::from_le_bytes(comp_block.data()[0..4].try_into().unwrap()) as usize;
+                        let decompressed = lz4_flex::block::decompress(
+                            &comp_block.data()[4..4 + compressed_len],
+                            (decomp_level.blocks::<u32>() * BLOCK_SIZE as u32) as usize,
+                        )
+                        .map_err(|_| Error::new(EIO))?;
+
+                        let decomp_offset = ((block_index - start_idx) * BLOCK_SIZE) as usize + block_offset;
+                        buf[i..i + to_read].copy_from_slice(&decompressed[decomp_offset..decomp_offset + to_read]);
                     } else {
-                        let block = self.read_block(unsafe { ptr.cast::<BlockRaw>() })?;
+                        let block = self.read_block(unsafe { p.cast::<BlockRaw>() })?;
                         buf[i..i + to_read]
                             .copy_from_slice(&block.data()[block_offset..block_offset + to_read]);
                     }
                 } else {
-                    return Err(Error::new(EIO));
+                    for b in &mut buf[i..i + to_read] {
+                        *b = 0;
+                    }
                 }
             } else if let Some(inline) = node.data().inline_data() {
                 if pos >= inline.len() as u64 {

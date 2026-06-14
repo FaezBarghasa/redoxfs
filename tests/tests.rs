@@ -25,7 +25,7 @@ where
     {
         let disk = DiskSparse::create(dbg!(&disk_path), 1024 * 1024 * 1024).unwrap();
         let ctime = dbg!(time::SystemTime::now().duration_since(time::UNIX_EPOCH)).unwrap();
-        FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos(), false).unwrap();
+        FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos()).unwrap();
     }
     let res = callback(&disk_path);
 
@@ -287,13 +287,13 @@ fn many_create_write_list_find_read_delete() {
     let ctime = time::SystemTime::now()
         .duration_since(time::UNIX_EPOCH)
         .unwrap();
-    let mut fs = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos(), false).unwrap();
+    let fs = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos()).unwrap();
     let tree_ptr = TreePtr::<Node>::root();
     let total_count = 3000;
 
     // Create a bunch of files
     for i in 0..total_count {
-        let result = fs.tx(|tx| {
+        let result = fs.lock().tx(|tx| {
             tx.create_node(
                 tree_ptr,
                 &format!("file{i:05}"),
@@ -307,7 +307,7 @@ fn many_create_write_list_find_read_delete() {
         }
 
         let file_node = result.unwrap();
-        let result = fs.tx(|tx| {
+        let result = fs.lock().tx(|tx| {
             tx.write_node(
                 file_node.ptr(),
                 0,
@@ -325,7 +325,7 @@ fn many_create_write_list_find_read_delete() {
     // Confirm that they can be listed
     {
         let mut children = Vec::<DirEntry>::with_capacity(total_count);
-        let _ = fs.tx(|tx| tx.child_nodes(tree_ptr, &mut children)).unwrap();
+        let _ = fs.lock().tx(|tx| tx.child_nodes(tree_ptr, &mut children)).unwrap();
         assert_eq!(
             children.len(),
             total_count,
@@ -346,7 +346,7 @@ fn many_create_write_list_find_read_delete() {
 
     // Find and read the files
     for i in 0..total_count {
-        let result = fs.tx(|tx| tx.find_node(tree_ptr, &format!("file{i:05}")));
+        let result = fs.lock().tx(|tx| tx.find_node(tree_ptr, &format!("file{i:05}")));
         if result.is_err() {
             println!("Failure on find node iteration {i}");
         }
@@ -354,7 +354,7 @@ fn many_create_write_list_find_read_delete() {
         let file_node = result.unwrap();
         let offset = 0;
         let mut buf = [0_u8; 32];
-        let result = fs.tx(|tx| {
+        let result = fs.lock().tx(|tx| {
             tx.read_node(
                 file_node.ptr(),
                 offset,
@@ -374,12 +374,12 @@ fn many_create_write_list_find_read_delete() {
     // Delete all the files
     for i in 0..total_count {
         let file_name = format!("file{i:05}");
-        let result = fs.tx(|tx| tx.remove_node(tree_ptr, &file_name, Node::MODE_FILE));
+        let result = fs.lock().tx(|tx| tx.remove_node(tree_ptr, &file_name, Node::MODE_FILE));
         if result.is_err() {
             println!("Failure on delete iteration {i}");
             result.unwrap();
         }
-        let result = fs.tx(|tx| tx.find_node(tree_ptr, &file_name));
+        let result = fs.lock().tx(|tx| tx.find_node(tree_ptr, &file_name));
         if !result.is_err() || result.err().unwrap().errno != syscall::error::ENOENT {
             println!("Failure on delete verification iteration {i}");
             assert!(false, "Deletion appears to ahve failred");

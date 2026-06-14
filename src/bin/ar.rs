@@ -71,9 +71,9 @@ fn main() {
         &bootloader,
         ctime.as_secs(),
         ctime.subsec_nanos(),
-        false,
     ) {
-        Ok(mut fs) => {
+        Ok(fs_mux) => {
+            let mut fs = fs_mux.lock();
             let size = match archive(&mut fs, &folder_path) {
                 Ok(ok) => ok,
                 Err(err) => {

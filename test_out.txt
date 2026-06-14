@@ -1,0 +1,429 @@
+   Compiling redoxfs v0.8.2 (/home/jrad/RustroverProjects/redoxos/redoxfs)
+warning: unused import: `std::fs`
+ --> src/clone.rs:1:5
+  |
+1 | use std::fs;
+  |     ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::os::unix::ffi::OsStrExt`
+ --> src/clone.rs:3:5
+  |
+3 | use std::os::unix::ffi::OsStrExt;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::path::Path`
+ --> src/clone.rs:4:5
+  |
+4 | use std::path::Path;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused import: `BlockTrait`
+ --> src/clone.rs:6:23
+  |
+6 | use crate::{BlockPtr, BlockTrait, Disk, FileSystem, Node, Transaction, TreePtr, BLOCK_SIZE};
+  |                       ^^^^^^^^^^
+
+warning: unused import: `EIO`
+  --> src/disk/mod.rs:21:37
+   |
+21 | use syscall::error::{Error, Result, EIO};
+   |                                     ^^^
+
+warning: unused imports: `max` and `mem`
+ --> src/transaction.rs:7:11
+  |
+7 |     cmp::{max, min},
+  |           ^^^
+8 |     mem,
+  |     ^^^
+
+warning: unused import: `ENOTEMPTY`
+  --> src/transaction.rs:12:74
+   |
+12 |     Error, Result, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, ERANGE,
+   |                                                                          ^^^^^^^^^
+
+warning: unused imports: `HEADER_RING` and `RECORD_LEVEL`
+  --> src/transaction.rs:22:27
+   |
+22 |     DIR_ENTRY_MAX_LENGTH, HEADER_RING, RECORD_LEVEL,
+   |                           ^^^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused import: `Ordering`
+ --> src/driver/nvme_rs.rs:3:37
+  |
+3 | use core::sync::atomic::{AtomicU16, Ordering};
+  |                                     ^^^^^^^^
+
+warning: unused import: `EIO`
+ --> src/driver/nvme_rs.rs:5:30
+  |
+5 | use syscall::error::{Result, EIO};
+  |                              ^^^
+
+warning: unused import: `BlockAddr`
+ --> src/tests.rs:4:5
+  |
+4 |     BlockAddr, BlockData, BlockLevel, BlockMeta, BlockPtr, DirEntry, DirList, DiskMemory,
+  |     ^^^^^^^^^
+
+warning: unused import: `AllocCtx`
+ --> src/tests.rs:3:47
+  |
+3 |     transaction::{level_data, level_data_mut, AllocCtx, FsCtx},
+  |                                               ^^^^^^^^
+
+warning: value assigned to `final_header` is never read
+   --> src/filesystem.rs:205:36
+    |
+205 |             let mut final_header = Header::default();
+    |                                    ^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable `deallocated` is assigned to, but never used
+   --> src/transaction.rs:428:17
+    |
+428 |             let mut deallocated = 0;
+    |                 ^^^^^^^^^^^^^^^
+    |
+    = note: consider using `_deallocated` instead
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `deallocated` is never read
+   --> src/transaction.rs:433:25
+    |
+433 |                         deallocated += 1;
+    |                         ^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unnecessary `unsafe` block
+   --> src/transaction.rs:554:9
+    |
+554 |         unsafe {
+    |         ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> src/transaction.rs:647:38
+    |
+641 |         unsafe {
+    |         ------ because it's nested under this `unsafe` block
+...
+647 |             l0.data_mut().ptrs[i0] = unsafe { node.cast() };
+    |                                      ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> src/transaction.rs:649:26
+    |
+641 |         unsafe {
+    |         ------ because it's nested under this `unsafe` block
+...
+649 |             let l0_ptr = unsafe { self.write_block(l0)? };
+    |                          ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> src/transaction.rs:652:26
+    |
+641 |         unsafe {
+    |         ------ because it's nested under this `unsafe` block
+...
+652 |             let l1_ptr = unsafe { self.write_block(l1)? };
+    |                          ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> src/transaction.rs:655:26
+    |
+641 |         unsafe {
+    |         ------ because it's nested under this `unsafe` block
+...
+655 |             let l2_ptr = unsafe { self.write_block(l2)? };
+    |                          ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> src/transaction.rs:658:38
+    |
+641 |         unsafe {
+    |         ------ because it's nested under this `unsafe` block
+...
+658 |             self.header_mut().tree = unsafe { self.write_block(l3)? };
+    |                                      ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+   --> src/transaction.rs:636:14
+    |
+636 |         let (mut i3, mut i2, mut i1, mut i0) = found_slot.ok_or(Error::new(ENOSPC))?;
+    |              ----^^
+    |              |
+    |              help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/transaction.rs:636:22
+    |
+636 |         let (mut i3, mut i2, mut i1, mut i0) = found_slot.ok_or(Error::new(ENOSPC))?;
+    |                      ----^^
+    |                      |
+    |                      help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/transaction.rs:636:30
+    |
+636 |         let (mut i3, mut i2, mut i1, mut i0) = found_slot.ok_or(Error::new(ENOSPC))?;
+    |                              ----^^
+    |                              |
+    |                              help: remove this `mut`
+
+warning: unnecessary `unsafe` block
+   --> src/transaction.rs:682:26
+    |
+672 |         unsafe {
+    |         ------ because it's nested under this `unsafe` block
+...
+682 |             let l0_ptr = unsafe { self.write_block(l0)? };
+    |                          ^^^^^^ unnecessary `unsafe` block
+
+warning: unused variable: `total_blocks`
+    --> src/transaction.rs:1107:13
+     |
+1107 |         let total_blocks = self.header.size() / BLOCK_SIZE;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_total_blocks`
+
+warning: variable does not need to be mutable
+   --> src/tests.rs:612:9
+    |
+612 |     let mut fs_mux = FileSystem::create(disk, None, ctime.as_secs(), ctime.subsec_nanos()).unwrap();
+    |         ----^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/tests.rs:731:19
+    |
+731 |     with_redoxfs(|mut fs| {
+    |                   ----^^
+    |                   |
+    |                   help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src/tests.rs:1159:14
+     |
+1159 |         let (mut fs, _) = create_minimal_l2_htree(format!("child{:0242}__0", 0).as_str(), fs);
+     |              ----^^
+     |              |
+     |              help: remove this `mut`
+
+warning: associated function `for_bytes` is never used
+   --> src/block.rs:124:19
+    |
+120 | impl BlockLevel {
+    | --------------- associated function in this implementation
+...
+124 |     pub(crate) fn for_bytes(bytes: u64) -> Self {
+    |                   ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `into_parts` is never used
+   --> src/block.rs:181:26
+    |
+164 | impl<T> BlockData<T> {
+    | -------------------- method in this implementation
+...
+181 |     pub(crate) unsafe fn into_parts(self) -> (BlockAddr, T) {
+    |                          ^^^^^^^^^^
+
+warning: function `syscall_err` is never used
+ --> src/clone.rs:8:4
+  |
+8 | fn syscall_err(err: syscall::Error) -> io::Error {
+  |    ^^^^^^^^^^^
+
+warning: field `compress_cache` is never read
+  --> src/filesystem.rs:29:5
+   |
+23 | pub struct FileSystem<D: Disk> {
+   |            ---------- field in this struct
+...
+29 |     compress_cache: Box<[u8]>,
+   |     ^^^^^^^^^^^^^^
+
+warning: constant `HEADER_RING` is never used
+  --> src/header.rs:10:11
+   |
+10 | pub const HEADER_RING: u64 = 256;
+   |           ^^^^^^^^^^^
+
+warning: method `cast` is never used
+   --> src/htree.rs:108:19
+    |
+ 99 | impl<T> HTreePtr<T> {
+    | ------------------- method in this implementation
+...
+108 |     pub unsafe fn cast<U>(self) -> HTreePtr<U> {
+    |                   ^^^^
+
+warning: constant `ACL_TAG_OTHER` is never used
+  --> src/node.rs:17:11
+   |
+17 | pub const ACL_TAG_OTHER: u8 = 3;
+   |           ^^^^^^^^^^^^^
+
+warning: constant `ACL_TAG_MASK` is never used
+  --> src/node.rs:18:11
+   |
+18 | pub const ACL_TAG_MASK: u8 = 4;
+   |           ^^^^^^^^^^^^
+
+warning: method `owner` is never used
+  --> src/transaction.rs:45:8
+   |
+42 | pub trait AllocCtx {
+   |           -------- method in this trait
+...
+45 |     fn owner(&self) -> Option<(u32, u32)> {
+   |        ^^^^^
+
+warning: method `write_cache` is never used
+   --> src/transaction.rs:117:19
+    |
+ 89 | impl<'a, D: Disk> Transaction<'a, D> {
+    | ------------------------------------ method in this implementation
+...
+117 |     pub(crate) fn write_cache(&self) -> &BTreeMap<BlockAddr, Box<[u8]>> {
+    |                   ^^^^^^^^^^^
+
+warning: field `pending` is never read
+  --> src/driver/nvme_async.rs:15:5
+   |
+14 | pub struct NvmeDriverContext {
+   |            ----------------- field in this struct
+15 |     pending: hashbrown::HashMap<u16, Arc<Mutex<PendingRequest>>>,
+   |     ^^^^^^^
+
+warning: unused return value of `BlockData::<T>::swap_addr` that must be used
+   --> src/transaction.rs:164:9
+    |
+164 |         block.swap_addr(new_addr);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: don't forget to de-allocate old block address
+    = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+    |
+164 |         let _ = block.swap_addr(new_addr);
+    |         +++++++
+
+warning: `redoxfs` (lib test) generated 41 warnings (run `cargo fix --lib -p redoxfs --tests` to apply 18 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.56s
+     Running unittests src/lib.rs (target/debug/deps/redoxfs-610469712328b25c)
+
+running 1 test
+create_reserved: Starting transaction 1
+read_block_with_hint: reading BlockAddr(69888), write_cache keys: [BlockAddr(69632), BlockAddr(69888)]
+sync_allocator: allocator_log len=0
+sync_allocator: allocs[0] addr=BlockAddr(69888), non-null entries=1
+create_reserved: Starting reset_allocator 1
+read_block_with_hint: reading BlockAddr(69888), write_cache keys: []
+read_block_with_hint: reading BlockAddr(69888), write_cache keys: []
+sync_allocator: allocator_log len=0
+sync_allocator: allocs[0] addr=BlockAddr(69888), non-null entries=1
+reset_allocator: entry index=275, count=16109
+create_reserved: Starting transaction 2
+create_reserved: tx.header().tree=BlockPtr { addr: BlockAddr(69632), hash: 10992322723596991414 }
+create_reserved: tx.header().alloc=BlockPtr { addr: BlockAddr(69888), hash: 5778700276370459629 }
+create_reserved: root_ptr=BlockPtr { addr: BlockAddr(70144), hash: 11850476618107379489 }
+read_block_with_hint: reading BlockAddr(69632), write_cache keys: [BlockAddr(70144)]
+read_block_with_hint: reading BlockAddr(69632), write_cache keys: [BlockAddr(70144)]
+read_block_with_hint: reading BlockAddr(69888), write_cache keys: [BlockAddr(70144), BlockAddr(70400), BlockAddr(70656), BlockAddr(70912), BlockAddr(71168)]
+sync_allocator: allocator_log len=4
+sync_allocator: allocs[0] addr=BlockAddr(69888), non-null entries=1
+sync_allocator: processing log entry index=275, count=-1
+sync_allocator: successfully inserted into allocs[0] addr=BlockAddr(69888)
+sync_allocator: processing log entry index=276, count=-1
+sync_allocator: successfully inserted into allocs[0] addr=BlockAddr(69888)
+sync_allocator: processing log entry index=277, count=-1
+sync_allocator: successfully inserted into allocs[0] addr=BlockAddr(69888)
+sync_allocator: processing log entry index=278, count=-1
+sync_allocator: successfully inserted into allocs[0] addr=BlockAddr(69888)
+create_reserved: Starting reset_allocator 2
+read_block_with_hint: reading BlockAddr(69888), write_cache keys: []
+read_block_with_hint: reading BlockAddr(69888), write_cache keys: []
+sync_allocator: allocator_log len=0
+sync_allocator: allocs[0] addr=BlockAddr(69888), non-null entries=5
+reset_allocator: entry index=275, count=16109
+reset_allocator: entry index=275, count=-1
+reset_allocator: entry index=276, count=-1
+reset_allocator: entry index=277, count=-1
+reset_allocator: entry index=278, count=-1
+create_reserved: Finished successfully
+read_block_with_hint: reading BlockAddr(70400), write_cache keys: []
+read_block_with_hint: reading BlockAddr(70656), write_cache keys: []
+read_block_with_hint: reading BlockAddr(70912), write_cache keys: []
+read_block_with_hint: reading BlockAddr(71168), write_cache keys: []
+read_block_with_hint: reading BlockAddr(70144), write_cache keys: []
+read_block_with_hint: reading BlockAddr(70400), write_cache keys: [BlockAddr(71424)]
+read_block_with_hint: reading BlockAddr(70656), write_cache keys: [BlockAddr(71424)]
+read_block_with_hint: reading BlockAddr(70912), write_cache keys: [BlockAddr(71424)]
+read_block_with_hint: reading BlockAddr(71168), write_cache keys: [BlockAddr(71424)]
+read_block_with_hint: reading BlockAddr(71168), write_cache keys: [BlockAddr(71424)]
+read_block_with_hint: reading BlockAddr(70400), write_cache keys: [BlockAddr(71424)]
+read_block_with_hint: reading BlockAddr(70656), write_cache keys: [BlockAddr(71424)]
+read_block_with_hint: reading BlockAddr(70912), write_cache keys: [BlockAddr(71424)]
+read_block_with_hint: reading BlockAddr(71168), write_cache keys: [BlockAddr(71424)]
+read_block_with_hint: reading BlockAddr(71680), write_cache keys: [BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448)]
+read_block_with_hint: reading BlockAddr(71936), write_cache keys: [BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448)]
+read_block_with_hint: reading BlockAddr(72192), write_cache keys: [BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448)]
+read_block_with_hint: reading BlockAddr(72448), write_cache keys: [BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448)]
+read_block_with_hint: reading BlockAddr(71424), write_cache keys: [BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448)]
+read_block_with_hint: reading BlockAddr(71680), write_cache keys: [BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(71936), write_cache keys: [BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(72192), write_cache keys: [BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(72448), write_cache keys: [BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(70144), write_cache keys: [BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(71680), write_cache keys: [BlockAddr(70144), BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(71936), write_cache keys: [BlockAddr(70144), BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(72192), write_cache keys: [BlockAddr(70144), BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(72448), write_cache keys: [BlockAddr(70144), BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(71424), write_cache keys: [BlockAddr(70144), BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(71680), write_cache keys: [BlockAddr(70144), BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(71936), write_cache keys: [BlockAddr(70144), BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(72192), write_cache keys: [BlockAddr(70144), BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(72448), write_cache keys: [BlockAddr(70144), BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(71424), write_cache keys: [BlockAddr(70144), BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+read_block_with_hint: reading BlockAddr(69888), write_cache keys: [BlockAddr(70144), BlockAddr(71424), BlockAddr(71680), BlockAddr(71936), BlockAddr(72192), BlockAddr(72448), BlockAddr(72704)]
+sync_allocator: allocator_log len=4
+sync_allocator: allocs[0] addr=BlockAddr(69888), non-null entries=5
+sync_allocator: processing log entry index=280, count=-1
+sync_allocator: successfully inserted into allocs[0] addr=BlockAddr(69888)
+sync_allocator: processing log entry index=281, count=-1
+sync_allocator: successfully inserted into allocs[0] addr=BlockAddr(69888)
+sync_allocator: processing log entry index=282, count=-1
+sync_allocator: successfully inserted into allocs[0] addr=BlockAddr(69888)
+sync_allocator: processing log entry index=283, count=-1
+sync_allocator: successfully inserted into allocs[0] addr=BlockAddr(69888)
+read_block_with_hint: reading BlockAddr(71680), write_cache keys: []
+read_block_with_hint: reading BlockAddr(71936), write_cache keys: []
+read_block_with_hint: reading BlockAddr(72192), write_cache keys: []
+read_block_with_hint: reading BlockAddr(72448), write_cache keys: []
+read_block_with_hint: reading BlockAddr(71424), write_cache keys: []
+
+thread 'tests::compression_test' (151161) panicked at src/tests.rs:691:14:
+called `Result::unwrap()` on an `Err` value: I/O error
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::compression_test ... FAILED
+
+failures:
+
+failures:
+    tests::compression_test
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `--lib`

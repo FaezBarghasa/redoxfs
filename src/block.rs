@@ -205,9 +205,11 @@ impl<T: BlockTrait> BlockData<T> {
 
 impl<T: ops::Deref<Target = [u8]>> BlockData<T> {
     pub fn create_ptr(&self) -> BlockPtr<T> {
+        let hash_bytes = blake3::hash(self.data.deref());
+        let hash_u64 = u64::from_le_bytes(hash_bytes.as_bytes()[0..8].try_into().unwrap());
         BlockPtr {
             addr: self.addr.0.into(),
-            hash: seahash::hash(self.data.deref()).into(),
+            hash: hash_u64.into(),
             phantom: PhantomData,
         }
     }

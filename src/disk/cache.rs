@@ -426,4 +426,8 @@ impl<T: Disk> Disk for DiskCache<T> {
     fn sync(&mut self) -> Result<()> {
         self.inner.sync()
     }
+
+    unsafe fn read_mirror_at(&mut self, mirror_idx: usize, block: u64, buffer: &mut [u8]) -> Result<usize> {
+        self.inner.read_mirror_at(mirror_idx, block, buffer)
+    }
 }

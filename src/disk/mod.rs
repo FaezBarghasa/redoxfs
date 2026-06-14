@@ -183,4 +183,11 @@ pub trait Disk {
     fn sync(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Read from a specific mirror index (0 or 1).
+    ///
+    /// The default implementation returns ENOSYS.
+    unsafe fn read_mirror_at(&mut self, _mirror_idx: usize, _block: u64, _buffer: &mut [u8]) -> Result<usize> {
+        Err(Error::new(syscall::error::ENOSYS))
+    }
 }

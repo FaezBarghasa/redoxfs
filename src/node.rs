@@ -232,11 +232,11 @@ pub struct Node {
     /// Padding.
     /// BLOCK_SIZE = 4096.
     /// Header = 75 bytes.
-    /// AclPtr = 32 bytes.
-    /// NodeLevelData = 124 * 32 = 3968 bytes.
-    /// Total used = 75 + 32 + 3968 = 4075 bytes.
-    /// Padding = 4096 - 4075 = 21 bytes.
-    pub padding: [u8; 21],
+    /// AclPtr = 16 bytes.
+    /// NodeLevelData = 124 * 16 = 1984 bytes.
+    /// Total used = 75 + 16 + 1984 = 2075 bytes.
+    /// Padding = 4096 - 2075 = 2021 bytes.
+    pub padding: [u8; 2021],
 
     /// Pointer to the ACL list
     pub acl_ptr: BlockPtr<AclList>,
@@ -274,7 +274,7 @@ impl Default for Node {
             record_level: 0.into(),
             compression_hint: 0,
             flags: 0.into(),
-            padding: [0; 21],
+            padding: [0; 2021],
             acl_ptr: BlockPtr::default(),
             level_data: NodeLevelData::default(),
         }
@@ -607,7 +607,7 @@ fn node_inline_data_test() {
 
     let node_addr = &node as *const Node as usize;
     // Header size + padding + acl_ptr size
-    let meta_size = 75 + 21 + 32; 
+    let meta_size = 75 + 2021 + 16; 
     {
         let inline_data = node.inline_data().unwrap();
         let inline_data_addr = inline_data.as_ptr() as usize;

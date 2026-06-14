@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn htree_ptr_size_test() {
-        assert_eq!(mem::size_of::<HTreePtr<BlockRaw>>(), 36);
+        assert_eq!(mem::size_of::<HTreePtr<BlockRaw>>(), 20);
     }
 
     #[test]

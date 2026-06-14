@@ -134,6 +134,14 @@ impl<D: Disk> Disk for DiskMirror<D> {
         }
         result
     }
+
+    unsafe fn read_mirror_at(&mut self, mirror_idx: usize, block: u64, buffer: &mut [u8]) -> Result<usize> {
+        if mirror_idx < 2 && (self.active_mask & (1 << mirror_idx)) != 0 {
+            self.disks[mirror_idx].read_at(block, buffer)
+        } else {
+            Err(Error::new(EIO))
+        }
+    }
 }
 
 #[cfg(test)]

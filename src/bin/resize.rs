@@ -120,7 +120,7 @@ fn resize<D: Disk>(fs: &mut FileSystem<D>, size_arg: String) -> Result<(), Strin
 
     fs.tx(|tx| {
         tx.header_mut().size = new_size.into();
-        tx.header_changed = true;
+        tx.set_header_changed(true);
         Ok(())
     })
         .map_err(|err| format!("transaction failed: {}", err))
@@ -152,7 +152,7 @@ fn main() {
         }
     };
 
-    let mut fs = match FileSystem::open(disk, None, None, true, false) {
+    let fs_mux = match FileSystem::open(disk, None, None, true) {
         Ok(fs) => fs,
         Err(err) => {
             eprintln!(
@@ -162,6 +162,8 @@ fn main() {
             process::exit(1);
         }
     };
+
+    let mut fs = fs_mux.lock();
 
     match resize(&mut fs, size_arg) {
         Ok(()) => {}

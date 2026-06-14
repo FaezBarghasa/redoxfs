@@ -117,7 +117,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 reply.entry(&TTL, &node_attr(&node), 0);
             }
             Err(err) => {
-                reply.error(err.errno);
+                reply.error(fuser::Errno::from_i32(err.errno));
             }
         }
     }
@@ -129,7 +129,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 reply.attr(&TTL, &node_attr(&node));
             }
             Err(err) => {
-                reply.error(err.errno);
+                reply.error(fuser::Errno::from_i32(err.errno));
             }
         }
     }
@@ -157,7 +157,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
         let mut node = match self.fs.tx(|tx| tx.read_tree(node_ptr)) {
             Ok(ok) => ok,
             Err(err) => {
-                reply.error(err.errno);
+                reply.error(fuser::Errno::from_i32(err.errno));
                 return;
             }
         };
@@ -214,7 +214,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                     }
                 }
                 Err(err) => {
-                    reply.error(err.errno);
+                    reply.error(fuser::Errno::from_i32(err.errno));
                     return;
                 }
             }
@@ -224,7 +224,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
 
         if node_changed {
             if let Err(err) = self.fs.tx(|tx| tx.sync_tree(node)) {
-                reply.error(err.errno);
+                reply.error(fuser::Errno::from_i32(err.errno));
                 return;
             }
         }
@@ -260,7 +260,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 reply.data(&data[..count]);
             }
             Err(err) => {
-                reply.error(err.errno);
+                reply.error(fuser::Errno::from_i32(err.errno));
             }
         }
     }
@@ -293,7 +293,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 reply.written(count as u32);
             }
             Err(err) => {
-                reply.error(err.errno);
+                reply.error(fuser::Errno::from_i32(err.errno));
             }
         }
     }
@@ -342,7 +342,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                     let node = match self.fs.tx(|tx| tx.read_tree(child.node_ptr())) {
                         Ok(ok) => ok,
                         Err(err) => {
-                            reply.error(err.errno);
+                            reply.error(fuser::Errno::from_i32(err.errno));
                             return;
                         }
                     };
@@ -367,7 +367,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 reply.ok();
             }
             Err(err) => {
-                reply.error(err.errno);
+                reply.error(fuser::Errno::from_i32(err.errno));
             }
         }
     }
@@ -397,7 +397,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 reply.created(&TTL, &node_attr(&node), 0, 0, 0);
             }
             Err(error) => {
-                reply.error(error.errno);
+                reply.error(fuser::Errno::from_i32(error.errno));
             }
         }
     }
@@ -426,7 +426,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 reply.entry(&TTL, &node_attr(&node), 0);
             }
             Err(error) => {
-                reply.error(error.errno);
+                reply.error(fuser::Errno::from_i32(error.errno));
             }
         }
     }
@@ -441,7 +441,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 reply.ok();
             }
             Err(err) => {
-                reply.error(err.errno);
+                reply.error(fuser::Errno::from_i32(err.errno));
             }
         }
     }
@@ -456,7 +456,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 reply.ok();
             }
             Err(err) => {
-                reply.error(err.errno);
+                reply.error(fuser::Errno::from_i32(err.errno));
             }
         }
     }
@@ -503,7 +503,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 reply.entry(&TTL, &node_attr(&node), 0);
             }
             Err(error) => {
-                reply.error(error.errno);
+                reply.error(fuser::Errno::from_i32(error.errno));
             }
         }
     }
@@ -525,7 +525,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
                 reply.data(&data[..count]);
             }
             Err(err) => {
-                reply.error(err.errno);
+                reply.error(fuser::Errno::from_i32(err.errno));
             }
         }
     }
@@ -550,7 +550,7 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
             .tx(|tx| tx.rename_node(orig_parent_ptr, orig_name, new_parent_ptr, new_name))
         {
             Ok(()) => reply.ok(),
-            Err(err) => reply.error(err.errno),
+            Err(err) => reply.error(fuser::Errno::from_i32(err.errno)),
         }
     }
 
@@ -566,13 +566,13 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
     ) {
         if name.to_str() == Some("system.posix_acl_access") {
             if value.len() < 4 {
-                reply.error(syscall::error::EINVAL);
+                reply.error(fuser::Errno::from_i32(syscall::error::EINVAL));
                 return;
             }
 
             let count = (value.len() - 4) / 8;
             if count > crate::node::ACL_ENTRIES_PER_BLOCK {
-                reply.error(syscall::error::ENOSPC);
+                reply.error(fuser::Errno::from_i32(syscall::error::ENOSPC));
                 return;
             }
 
@@ -605,14 +605,14 @@ impl<D: Disk> Filesystem for Fuse<'_, D> {
             let node_ptr = TreePtr::<Node>::new(node_id as u32);
             match self.fs.tx(|tx| tx.set_acl(node_ptr, &acl)) {
                 Ok(_) => reply.ok(),
-                Err(e) => reply.error(e.errno),
+                Err(e) => reply.error(fuser::Errno::from_i32(e.errno)),
             }
         } else {
-            reply.error(syscall::error::EOPNOTSUPP);
+            reply.error(fuser::Errno::from_i32(syscall::error::EOPNOTSUPP));
         }
     }
 
     fn getxattr(&mut self, _req: &Request, _inode: u64, _name: &OsStr, _size: u32, reply: ReplyXattr) {
-        reply.error(syscall::error::EOPNOTSUPP);
+        reply.error(fuser::Errno::from_i32(syscall::error::EOPNOTSUPP));
     }
 }

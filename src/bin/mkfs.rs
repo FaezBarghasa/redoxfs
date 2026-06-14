@@ -100,15 +100,15 @@ fn main() {
         &bootloader,
         ctime.as_secs(),
         ctime.subsec_nanos(),
-        false,
     ) {
-        Ok(filesystem) => {
-            let uuid = Uuid::from_bytes(filesystem.header().uuid());
+        Ok(fs_mux) => {
+            let fs = fs_mux.lock();
+            let uuid = Uuid::from_bytes(fs.header().uuid());
             eprintln!(
                 "redoxfs-mkfs: created filesystem on {}, reserved {} blocks, size {} MB, uuid {}",
                 disk_path,
-                filesystem.block(),
-                filesystem.header().size() / 1000 / 1000,
+                fs.block(),
+                fs.header().size() / 1000 / 1000,
                 uuid.hyphenated()
             );
         }

@@ -55,7 +55,7 @@ impl<T> TreeData<T> {
 pub struct TreeList<T> {
     pub ptrs: [BlockPtr<T>; TREE_LIST_ENTRIES],
     pub full_flags: u128,
-    pub padding: [u8; 48],
+    pub padding: [u8; 2064],
 }
 
 impl<T> TreeList<T> {
@@ -95,7 +95,7 @@ unsafe impl<T> BlockTrait for TreeList<T> {
             Some(Self {
                 ptrs: [BlockPtr::default(); TREE_LIST_ENTRIES],
                 full_flags: 0,
-                padding: [0; 48],
+                padding: [0; 2064],
             })
         } else {
             None
