@@ -1,4 +1,15 @@
-extern crate fuser;
+extern crate fuser as fuser_crate;
+
+mod fuser {
+    pub use super::fuser_crate::*;
+    pub struct Errno;
+    impl Errno {
+        #[inline(always)]
+        pub fn from_i32(errno: i32) -> i32 {
+            errno
+        }
+    }
+}
 
 use std::cmp;
 use std::ffi::OsStr;

@@ -59,7 +59,7 @@ path = "tests/recovery.rs"
 required-features = ["std"]
 
 [dependencies]
-seahash = { version = "4.1.0", default-features = false }m
+seahash = { version = "4.1.0", default-features = false }
 aes = { version = "0.9.1", default-features = false }
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
 base64ct = { version = "1", default-features = false }
@@ -107,7 +107,7 @@ std = [
 ]
 
 [target.'cfg(not(target_os = "redox"))'.dependencies]
-fuser = { version = "0.17.0", optional = true }
+fuser = { version = "0.14.0", optional = true }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 libredox = { version = "0.1.6", features = ["call"], optional = true }
