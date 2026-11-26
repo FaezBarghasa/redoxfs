@@ -88,7 +88,6 @@ mod quota;
 // New Modules
 pub mod blinktree;
 #[cfg(feature = "std")]
-pub mod driver;
 pub mod journal;
 pub mod shard;
 
