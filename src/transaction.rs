@@ -18,7 +18,7 @@ use crate::{
     journal::JournalEntry,
     AllocEntry, AllocList, Allocator, BlockAddr, BlockData, BlockLevel, BlockList, BlockMeta,
     BlockPtr, BlockRaw, BlockTrait, DirEntry, DirList, Disk, FileSystem, Header, Node,
-    NodeLevelData, TreeData, TreeList, TreePtr, ALLOC_GC_THRESHOLD, BLOCK_SIZE,
+    NodeFlags, NodeLevelData, TreeData, TreeList, TreePtr, ALLOC_GC_THRESHOLD, BLOCK_SIZE,
     DIR_ENTRY_MAX_LENGTH, HEADER_RING, RECORD_LEVEL,
 };
 use std::cmp;
@@ -208,6 +208,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
         hint: BlockTypeHint,
     ) -> Result<BlockData<T>> {
         if ptr.is_null() {
+            println!("read_block_with_hint: ptr is null!");
             return Err(Error::new(ENOENT));
         }
 
@@ -248,13 +249,17 @@ impl<'a, D: Disk> Transaction<'a, D> {
             }
         } else {
             let block_offset = self.fs.block();
-            unsafe {
+            let disk_res = unsafe {
                 self.fs.disk().read_at_with_hint(
                     block_offset + ptr.addr().index(),
                     &mut data,
                     hint,
-                )?;
+                )
             };
+            if let Err(e) = disk_res {
+                println!("read_block_with_hint: disk read_at_with_hint failed for {:?}: {:?}", ptr.addr(), e);
+                return Err(e);
+            }
             self.fs.decrypt(&mut data, ptr.addr());
             let block = BlockData::new(ptr.addr(), data);
             let calculated = block.create_ptr().hash();
@@ -296,7 +301,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
             }
         }
 
-        println!("read_block_with_hint: returning EIO");
+        println!("read_block_with_hint: returning EIO for {:?}", ptr.addr());
         Err(Error::new(EIO))
     }
 
@@ -535,11 +540,57 @@ impl<'a, D: Disk> Transaction<'a, D> {
         ptr: TreePtr<T>,
     ) -> Result<TreeData<T>> {
         let (i3, i2, i1, i0) = ptr.indexes();
-        let l3 = self.read_block(self.header.tree)?;
-        let l2 = self.read_block(l3.data().ptrs[i3])?;
-        let l1 = self.read_block(l2.data().ptrs[i2])?;
-        let l0 = self.read_block(l1.data().ptrs[i1])?;
-        let raw = self.read_block(l0.data().ptrs[i0])?;
+        println!("read_tree: id={}, indices=({}, {}, {}, {})", ptr.id(), i3, i2, i1, i0);
+        let l3 = match self.read_block(self.header.tree) {
+            Ok(b) => {
+                println!("read_tree: read l3 successfully at {:?}", self.header.tree.addr());
+                b
+            },
+            Err(e) => {
+                println!("read_tree: failed to read l3 tree: {:?}", e);
+                return Err(e);
+            }
+        };
+        let l2 = match self.read_block(l3.data().ptrs[i3]) {
+            Ok(b) => {
+                println!("read_tree: read l2 successfully at {:?}", l3.data().ptrs[i3].addr());
+                b
+            },
+            Err(e) => {
+                println!("read_tree: failed to read l2 ptr {:?}: {:?}", l3.data().ptrs[i3], e);
+                return Err(e);
+            }
+        };
+        let l1 = match self.read_block(l2.data().ptrs[i2]) {
+            Ok(b) => {
+                println!("read_tree: read l1 successfully at {:?}", l2.data().ptrs[i2].addr());
+                b
+            },
+            Err(e) => {
+                println!("read_tree: failed to read l1 ptr {:?}: {:?}", l2.data().ptrs[i2], e);
+                return Err(e);
+            }
+        };
+        let l0 = match self.read_block(l1.data().ptrs[i1]) {
+            Ok(b) => {
+                println!("read_tree: read l0 successfully at {:?}", l1.data().ptrs[i1].addr());
+                b
+            },
+            Err(e) => {
+                println!("read_tree: failed to read l0 ptr {:?}: {:?}", l1.data().ptrs[i1], e);
+                return Err(e);
+            }
+        };
+        let raw = match self.read_block(l0.data().ptrs[i0]) {
+            Ok(b) => {
+                println!("read_tree: read raw successfully at {:?}", l0.data().ptrs[i0].addr());
+                b
+            },
+            Err(e) => {
+                println!("read_tree: failed to read raw ptr {:?}: {:?}", l0.data().ptrs[i0], e);
+                return Err(e);
+            }
+        };
         let mut data = T::empty(raw.addr().level()).ok_or(Error::new(ENOENT))?;
         data.copy_from_slice(raw.data());
         Ok(TreeData::new(ptr.id(), data))
@@ -860,7 +911,14 @@ impl<'a, D: Disk> Transaction<'a, D> {
         mtime: u64,
         mtime_nsec: u32,
     ) -> Result<usize> {
-        let mut node = self.read_tree(node_ptr)?;
+        println!("write_node: entered node_id={}, offset={}, buf.len()={}", node_ptr.id(), offset, buf.len());
+        let mut node = match self.read_tree(node_ptr) {
+            Ok(n) => n,
+            Err(e) => {
+                println!("write_node: read_tree failed for node_id={}: {:?}", node_ptr.id(), e);
+                return Err(e);
+            }
+        };
 
         if node.data().is_dir() {
             return Err(Error::new(EISDIR));
@@ -873,21 +931,55 @@ impl<'a, D: Disk> Transaction<'a, D> {
         let mut current_offset = offset;
         let mut remaining_buf = buf;
 
-        // Handle inline data
-        if node.data().has_inline_data() {
-            if let Some(inline_data_slice) = node.data_mut().inline_data_mut() {
-                let inline_len = inline_data_slice.len() as u64;
-                if current_offset < inline_len {
-                    let write_start = current_offset as usize;
-                    let write_end =
-                        min(inline_len, current_offset + remaining_buf.len() as u64) as usize;
-                    let len_to_write = write_end - write_start;
+        // Try writing to inline data if node has inline data
+        let node_size = node.data().size();
+        let convert_inline = if node.data().has_inline_data() {
+            if let Some(inline_data) = node.data_mut().inline_data_mut() {
+                let end = current_offset + (remaining_buf.len() as u64);
+                if end <= inline_data.len() as u64 {
+                    inline_data[current_offset as usize..end as usize].copy_from_slice(remaining_buf);
+                    current_offset += remaining_buf.len() as u64;
+                    bytes_written += remaining_buf.len();
+                    remaining_buf = &[];
+                    if node_size < current_offset {
+                        node.data_mut().set_size(current_offset);
+                    }
+                    None
+                } else {
+                    Some(inline_data[..cmp::min(node_size as usize, inline_data.len())].to_vec())
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-                    inline_data_slice[write_start..write_end]
-                        .copy_from_slice(&remaining_buf[..len_to_write]);
-                    bytes_written += len_to_write;
-                    current_offset += len_to_write as u64;
-                    remaining_buf = &remaining_buf[len_to_write..];
+        if let Some(inline_data) = convert_inline {
+            // If inline data cannot fit, convert node from inline data to level data
+            let mut flags = node.data().flags();
+            flags.remove(NodeFlags::INLINE_DATA);
+            node.data_mut().set_flags(flags);
+            node.data_mut().level_data = NodeLevelData::default();
+
+            // Re-write any existing inline data as blocks at offset 0
+            if !inline_data.is_empty() {
+                let mut inline_offset = 0u64;
+                let mut inline_rem = &inline_data[..];
+                let block_size = BLOCK_SIZE as u64;
+                let level_data_mut_ref = level_data_mut(&mut node)?;
+                while !inline_rem.is_empty() {
+                    let block_idx = (inline_offset / block_size) as usize;
+                    let len = cmp::min(inline_rem.len(), BLOCK_SIZE as usize);
+                    let new_addr = unsafe {
+                        self.allocate(&mut FsCtx, BlockMeta::new(BlockLevel::L0))
+                    }.ok_or(Error::new(ENOSPC))?;
+                    let mut b = BlockData::new(new_addr, BlockRaw::empty(BlockLevel::L0).unwrap());
+                    b.data_mut()[..len].copy_from_slice(&inline_rem[..len]);
+                    let p = unsafe { self.write_block(b)? };
+                    level_data_mut_ref.level0[block_idx] = unsafe { p.cast() };
+                    inline_offset += len as u64;
+                    inline_rem = &inline_rem[len..];
                 }
             }
         }
@@ -900,10 +992,17 @@ impl<'a, D: Disk> Transaction<'a, D> {
             let start_block_idx = current_offset / block_size;
 
             if start_block_idx >= 56 {
+                println!("write_node: start_block_idx {} >= 56 ERANGE", start_block_idx);
                 return Err(Error::new(ERANGE));
             }
 
-            let level_data_mut_ref = level_data_mut(&mut node)?;
+            let level_data_mut_ref = match level_data_mut(&mut node) {
+                Ok(l) => l,
+                Err(e) => {
+                    println!("write_node: level_data_mut failed: {:?}", e);
+                    return Err(e);
+                }
+            };
             
             while !remaining_buf.is_empty() {
                 let block_idx = (current_offset / block_size) as usize;
@@ -928,13 +1027,23 @@ impl<'a, D: Disk> Transaction<'a, D> {
 
                 if let Some((p, comp_start_idx, decomp_level)) = covered_compressed {
                     // 1. Decompress the existing compressed block
-                    let comp_block = self.read_block(unsafe { p.cast::<BlockRaw>() })?;
+                    println!("write_node: decompressing existing compressed block {:?}", p.addr());
+                    let comp_block = match self.read_block(unsafe { p.cast::<BlockRaw>() }) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            println!("write_node: read_block failed for {:?}: {:?}", p.addr(), e);
+                            return Err(e);
+                        }
+                    };
                     let compressed_len = u32::from_le_bytes(comp_block.data()[0..4].try_into().unwrap()) as usize;
                     let mut decompressed = lz4_flex::block::decompress(
                         &comp_block.data()[4..4 + compressed_len],
                         (decomp_level.blocks::<u32>() * BLOCK_SIZE as u32) as usize,
                     )
-                    .map_err(|_| Error::new(EIO))?;
+                    .map_err(|de_err| {
+                        println!("write_node: lz4 decompress failed: {:?}", de_err);
+                        Error::new(EIO)
+                    })?;
 
                     // 2. Modify decompressed data with write buffer
                     let decomp_offset = (current_offset - comp_start_idx as u64 * block_size) as usize;
@@ -1019,6 +1128,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
                 // If not in compressed block, check if we want to compress this write
                 if compression_hint == 1 && current_offset % BLOCK_SIZE == 0 {
                     let write_blocks = remaining_buf.len() as u64 / BLOCK_SIZE;
+                    println!("write_node: compression_hint=1, write_blocks={}", write_blocks);
                     if write_blocks > 1 && write_blocks.is_power_of_two() {
                         let decomp_level = BlockLevel(write_blocks.trailing_zeros() as usize);
                         let compressed = lz4_flex::block::compress(&remaining_buf[..write_blocks as usize * BLOCK_SIZE as usize]);
@@ -1030,11 +1140,13 @@ impl<'a, D: Disk> Transaction<'a, D> {
                                 break;
                             }
                         }
+                        println!("write_node: compressed_len={}, comp_level_opt={:?}", compressed_len, comp_level_opt);
                         if let Some(comp_level) = comp_level_opt {
                             let new_block_addr = unsafe {
                                 self.allocate(&mut FsCtx, BlockMeta::new_compressed(comp_level, decomp_level))
                             }
                             .ok_or(Error::new(ENOSPC))?;
+                            println!("write_node: allocated compressed block {:?}", new_block_addr);
 
                             let comp_block_size = comp_level.blocks::<u32>() as u64 * BLOCK_SIZE;
                             let mut block_data = vec![0u8; comp_block_size as usize];
@@ -1051,6 +1163,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
                             }
 
                             let new_block_ptr = unsafe { self.write_block(raw_block)? };
+                            println!("write_node: wrote compressed block ptr {:?}", new_block_ptr);
                             level_data_mut_ref.level0[block_idx] = unsafe { new_block_ptr.cast() };
                             for i in 1..decomp_level.blocks::<u32>() as usize {
                                 level_data_mut_ref.level0[block_idx + i] = BlockPtr::default();
@@ -1098,7 +1211,9 @@ impl<'a, D: Disk> Transaction<'a, D> {
             node.data_mut().set_size(current_offset);
         }
 
+        println!("write_node: calling sync_tree");
         self.sync_tree(node)?;
+        println!("write_node: sync_tree finished successfully");
 
         Ok(bytes_written)
     }

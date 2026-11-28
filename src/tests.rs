@@ -687,8 +687,14 @@ fn compression_test() {
     let data = vec![0u8; BLOCK_SIZE as usize * 32]; // 4KB * 32 = 128KB
     {
         let mut fs = fs_mux.lock();
-        fs.tx(|tx| tx.write_node(node.ptr(), 0, &data, ctime.as_secs(), ctime.subsec_nanos()))
-            .unwrap();
+        fs.tx(|tx| {
+            let res = tx.write_node(node.ptr(), 0, &data, ctime.as_secs(), ctime.subsec_nanos());
+            if let Err(ref e) = res {
+                eprintln!("tests::compression_test write_node failed: {:?}", e);
+            }
+            res
+        })
+        .unwrap();
     }
 
     // Check block level
